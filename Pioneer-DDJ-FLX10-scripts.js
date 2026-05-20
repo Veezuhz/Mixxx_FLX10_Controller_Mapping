@@ -188,7 +188,7 @@ PioneerDDJFLX10.wheelTouch = function(channel, control, value, status, group) {
 // so a slow spin doesn't trigger hundreds of nudges. Raise the threshold to
 // slow down, lower it to speed up.
 PioneerDDJFLX10._beatgridAccum = {1: 0, 2: 0, 3: 0, 4: 0};
-var BEATGRID_THRESHOLD = 8;
+var BEATGRID_THRESHOLD = 6;
 
 PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group) {
     var delta = value - 64;
