@@ -2109,6 +2109,46 @@
                 </options>
             </control>
             <control>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.beatgridAdjust</key>
+                <description>Beatgrid adjust CH1 (Shift+Jog)</description>
+                <status>0xB0</status>
+                <midino>0x26</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>PioneerDDJFLX10.beatgridAdjust</key>
+                <description>Beatgrid adjust CH2 (Shift+Jog)</description>
+                <status>0xB1</status>
+                <midino>0x26</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>PioneerDDJFLX10.beatgridAdjust</key>
+                <description>Beatgrid adjust CH3 (Shift+Jog)</description>
+                <status>0xB2</status>
+                <midino>0x26</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>PioneerDDJFLX10.beatgridAdjust</key>
+                <description>Beatgrid adjust CH4 (Shift+Jog)</description>
+                <status>0xB3</status>
+                <midino>0x26</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
                 <group>[EffectRack1_EffectUnit1_Effect1]</group>
                 <key>PioneerDDJFLX10.beatFxPad</key>
                 <description>BeatFX position 8</description>

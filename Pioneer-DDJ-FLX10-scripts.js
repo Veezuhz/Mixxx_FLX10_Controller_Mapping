@@ -182,6 +182,35 @@ PioneerDDJFLX10.wheelTouch = function(channel, control, value, status, group) {
     }
 };
 
+// Beatgrid nudge — triggered by CC 0x26 when Shift+Jog is used.
+// Values are relative, centered on 64: below = earlier, above = later.
+// Accumulate delta across ticks; fire one step per BEATGRID_THRESHOLD units
+// so a slow spin doesn't trigger hundreds of nudges. Raise the threshold to
+// slow down, lower it to speed up.
+PioneerDDJFLX10._beatgridAccum = {1: 0, 2: 0, 3: 0, 4: 0};
+var BEATGRID_THRESHOLD = 8;
+
+PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group) {
+    var delta = value - 64;
+    if (delta === 0) return;
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    var accum = PioneerDDJFLX10._beatgridAccum[deck];
+
+    // Reset accumulator on direction change to avoid phantom steps
+    if ((delta < 0 && accum > 0) || (delta > 0 && accum < 0)) {
+        accum = 0;
+    }
+    accum += delta;
+
+    if (Math.abs(accum) >= BEATGRID_THRESHOLD) {
+        var ctrl = accum < 0 ? "beats_translate_earlier" : "beats_translate_later";
+        engine.setValue(group, ctrl, 1);
+        engine.setValue(group, ctrl, 0);
+        accum = 0;
+    }
+    PioneerDDJFLX10._beatgridAccum[deck] = accum;
+};
+
 // Sensitivity functions
 PioneerDDJFLX10.sensitivityMinimizer = function (value, factor) {
     return (value/factor);
