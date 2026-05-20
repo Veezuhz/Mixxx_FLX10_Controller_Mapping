@@ -54,6 +54,17 @@
 //        * Keyshift mode
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
+// ─── TUNABLE PARAMETERS ──────────────────────────────────────────────────────
+// Jog scratch sensitivity: how many encoder intervals equal one vinyl revolution.
+// Higher = slower / less sensitive. Lower = faster / more sensitive.
+// Typical range: 512 (very fast) → 4096 (very slow). Default: 2048.
+var SCRATCH_INTERVALS_PER_REV = 1500;
+
+// Jog pitch-bend divisor: how much a jog nudge shifts playback rate.
+// Higher = smaller nudge. Lower = larger nudge.
+var JOG_BEND_DIVISOR = 16;
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Global variables
 var PioneerDDJFLX10 = {};
 
@@ -140,19 +151,10 @@ PioneerDDJFLX10.shutdown = function() {
 PioneerDDJFLX10.wheelTurn = function(channel, control, value, status, group) {
     var newValue = value - 64;
     var deckNumber = PioneerDDJFLX10._getDeckFromGroup(group);
-    
-    print("wheelTurn: deck " + deckNumber + " value " + newValue + " isScratching " + engine.isScratching(deckNumber)); // Debug
-    
     if (engine.isScratching(deckNumber)) {
-        // Scratch mode
-        var scratchValue = PioneerDDJFLX10.sensitivityMaximizer(newValue, 1.5);
-        print("Scratching with value " + scratchValue); // Debug
-        engine.scratchTick(deckNumber, scratchValue);
+        engine.scratchTick(deckNumber, newValue);
     } else {
-        // Pitch bend mode - using working implementation from Untitled-1.js
-        var bendValue = PioneerDDJFLX10.sensitivityMinimizer(newValue, 16);
-        print("Pitch bend with value " + bendValue); // Debug
-        engine.setValue(group, 'jog', bendValue);
+        engine.setValue(group, 'jog', PioneerDDJFLX10.sensitivityMinimizer(newValue, JOG_BEND_DIVISOR));
     }
 };
 
@@ -168,17 +170,10 @@ PioneerDDJFLX10.LedVuMeterCH4 = function (value) { PioneerDDJFLX10._sendVu(0xB3,
 
 PioneerDDJFLX10.wheelTouch = function(channel, control, value, status, group) {
     var deckNumber = PioneerDDJFLX10._getDeckFromGroup(group);
-    
-    if (value == 0x7F) {
-        // Enable scratch mode
-        var alpha = 1.0/8;
-        var beta = alpha/32;
-        print("Enabling scratch for deck " + deckNumber + " group " + group); // Debug
-        engine.scratchEnable(deckNumber, 32767, 33+1/3, alpha, beta);
+    if (value === 0x7F) {
+        engine.scratchEnable(deckNumber, SCRATCH_INTERVALS_PER_REV, 33+1/3, 1.0/8, (1.0/8)/32);
     } else {
-        // Disable scratch mode
-        print("Disabling scratch for deck " + deckNumber + " group " + group); // Debug
-        engine.scratchDisable(deckNumber);
+        engine.scratchDisable(deckNumber, false);
     }
 };
 
@@ -227,6 +222,66 @@ PioneerDDJFLX10.sensitivityMinimizer = function (value, factor) {
 PioneerDDJFLX10.sensitivityMaximizer = function (value, factor) {
     return (value*factor);
 };
+
+// ─── Memory cue navigation ───────────────────────────────────────────────────
+// Hot cue slots are used as memory cues. Navigation finds the nearest set cue
+// before/after the current playback position. Save finds the next empty slot.
+var MEM_CUE_SLOTS = 36;
+
+PioneerDDJFLX10.memCueSave = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    for (var i = 1; i <= MEM_CUE_SLOTS; i++) {
+        if (!engine.getValue(group, "hotcue_" + i + "_enabled")) {
+            engine.setValue(group, "hotcue_" + i + "_set", 1);
+            return;
+        }
+    }
+};
+
+PioneerDDJFLX10.memCuePrev = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var current = engine.getValue(group, "playposition") * engine.getValue(group, "track_samples");
+    var best = -1, bestCue = -1;
+    for (var i = 1; i <= MEM_CUE_SLOTS; i++) {
+        if (engine.getValue(group, "hotcue_" + i + "_enabled")) {
+            var pos = engine.getValue(group, "hotcue_" + i + "_position");
+            if (pos < current - 2000 && pos > best) {
+                best = pos; bestCue = i;
+            }
+        }
+    }
+    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_goto", 1);
+};
+
+PioneerDDJFLX10.memCueNext = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var current = engine.getValue(group, "playposition") * engine.getValue(group, "track_samples");
+    var best = Infinity, bestCue = -1;
+    for (var i = 1; i <= MEM_CUE_SLOTS; i++) {
+        if (engine.getValue(group, "hotcue_" + i + "_enabled")) {
+            var pos = engine.getValue(group, "hotcue_" + i + "_position");
+            if (pos > current + 2000 && pos < best) {
+                best = pos; bestCue = i;
+            }
+        }
+    }
+    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_goto", 1);
+};
+
+PioneerDDJFLX10.memCueDelete = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var current = engine.getValue(group, "playposition") * engine.getValue(group, "track_samples");
+    var best = Infinity, bestCue = -1;
+    for (var i = 1; i <= MEM_CUE_SLOTS; i++) {
+        if (engine.getValue(group, "hotcue_" + i + "_enabled")) {
+            var pos = engine.getValue(group, "hotcue_" + i + "_position");
+            var dist = Math.abs(pos - current);
+            if (dist < best) { best = dist; bestCue = i; }
+        }
+    }
+    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_clear", 1);
+};
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Shift buttons management
 PioneerDDJFLX10.shiftHandler = function(channel, control, value, status, group) {
