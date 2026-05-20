@@ -2149,6 +2149,16 @@
                 </options>
             </control>
             <control>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.waveformZoom</key>
+                <description>Waveform zoom CH1 (Shift+Rotary)</description>
+                <status>0xB6</status>
+                <midino>0x64</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
                 <group>[EffectRack1_EffectUnit1_Effect1]</group>
                 <key>PioneerDDJFLX10.beatFxPad</key>
                 <description>BeatFX position 8</description>

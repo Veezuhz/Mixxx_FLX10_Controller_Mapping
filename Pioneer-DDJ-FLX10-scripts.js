@@ -211,6 +211,14 @@ PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group
     PioneerDDJFLX10._beatgridAccum[deck] = accum;
 };
 
+// Waveform zoom — triggered by Shift+CH rotary (0xB6, CC 0x64).
+// Encoder uses two's complement: 1 = CW (zoom in), 127 = CCW (zoom out).
+PioneerDDJFLX10.waveformZoom = function(channel, control, value, status, group) {
+    var delta = value < 64 ? 1 : -1;
+    var zoom = engine.getValue(group, "waveform_zoom") + delta;
+    engine.setValue(group, "waveform_zoom", Math.max(1, zoom));
+};
+
 // Sensitivity functions
 PioneerDDJFLX10.sensitivityMinimizer = function (value, factor) {
     return (value/factor);
