@@ -250,7 +250,7 @@ PioneerDDJFLX10.memCuePrev = function(channel, control, value, status, group) {
             }
         }
     }
-    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_goto", 1);
+    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_gotoandstop", 1);
 };
 
 PioneerDDJFLX10.memCueNext = function(channel, control, value, status, group) {
@@ -265,7 +265,7 @@ PioneerDDJFLX10.memCueNext = function(channel, control, value, status, group) {
             }
         }
     }
-    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_goto", 1);
+    if (bestCue > 0) engine.setValue(group, "hotcue_" + bestCue + "_gotoandstop", 1);
 };
 
 PioneerDDJFLX10.memCueDelete = function(channel, control, value, status, group) {
