@@ -1481,26 +1481,6 @@
                 </options>
             </control>
             <control>
-                <group>[Channel1]</group>
-                <key>orientation</key>
-                <description>Orientation </description>
-                <status>0x90</status>
-                <midino>0x16</midino>
-                <options>
-                    <normal/>
-                </options>
-            </control>
-            <control>
-                <group>[Channel3]</group>
-                <key>orientation</key>
-                <description>Orientation </description>
-                <status>0x92</status>
-                <midino>0x16</midino>
-                <options>
-                    <normal/>
-                </options>
-            </control>
-            <control>
                 <group>[EffectRack1_EffectUnit1]</group>
                 <key>PioneerDDJFLX10.beatFxChannelSelect</key>
                 <description>BeatFX channel select SP/no-op (note 0x16)</description>
@@ -1590,34 +1570,25 @@
                     <normal/>
                 </options>
             </control>
+            <!-- Sound Color FX knob CH1 — 14-bit, MSB=CC0x17 + LSB=CC0x37 on 0xB6 -->
             <control>
-                <group>[QuickEffectRack1_[Channel1]]</group>
-                <key>super1</key>
-                <description>Super1 QuickEffect Rack1 Channel1</description>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.soundColorFxKnobMSB</key>
+                <description>Sound Color FX knob MSB CH1</description>
                 <status>0xB6</status>
                 <midino>0x17</midino>
                 <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
-                <group>[Channel2]</group>
-                <key>orientation</key>
-                <description>Orientation Channel2</description>
-                <status>0x91</status>
-                <midino>0x18</midino>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.soundColorFxKnobLSB</key>
+                <description>Sound Color FX knob LSB CH1</description>
+                <status>0xB6</status>
+                <midino>0x37</midino>
                 <options>
-                    <normal/>
-                </options>
-            </control>
-            <control>
-                <group>[Channel4]</group>
-                <key>orientation</key>
-                <description>Orientation Channel4</description>
-                <status>0x93</status>
-                <midino>0x18</midino>
-                <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
@@ -4052,6 +4023,352 @@
                 <midino>0x7A</midino>
                 <options>
                     <normal/>
+                </options>
+            </control>
+            <!-- Beat Jump 4 beats backward CH1–4 -->
+            <control>
+                <group>[Channel1]</group>
+                <key>beatjump_4_backward</key>
+                <description>Beat Jump 4 Backward CH1</description>
+                <status>0x90</status>
+                <midino>0x5E</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>beatjump_4_backward</key>
+                <description>Beat Jump 4 Backward CH2</description>
+                <status>0x91</status>
+                <midino>0x5E</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>beatjump_4_backward</key>
+                <description>Beat Jump 4 Backward CH3</description>
+                <status>0x92</status>
+                <midino>0x5E</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>beatjump_4_backward</key>
+                <description>Beat Jump 4 Backward CH4</description>
+                <status>0x93</status>
+                <midino>0x5E</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <!-- Beat Jump 4 beats forward CH1–4 -->
+            <control>
+                <group>[Channel1]</group>
+                <key>beatjump_4_forward</key>
+                <description>Beat Jump 4 Forward CH1</description>
+                <status>0x90</status>
+                <midino>0x5F</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>beatjump_4_forward</key>
+                <description>Beat Jump 4 Forward CH2</description>
+                <status>0x91</status>
+                <midino>0x5F</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>beatjump_4_forward</key>
+                <description>Beat Jump 4 Forward CH3</description>
+                <status>0x92</status>
+                <midino>0x5F</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>beatjump_4_forward</key>
+                <description>Beat Jump 4 Forward CH4</description>
+                <status>0x93</status>
+                <midino>0x5F</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <!-- Beat Jump 16 beats backward CH1–4 (Shift + Left) -->
+            <control>
+                <group>[Channel1]</group>
+                <key>beatjump_16_backward</key>
+                <description>Beat Jump 16 Backward CH1</description>
+                <status>0x90</status>
+                <midino>0x61</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>beatjump_16_backward</key>
+                <description>Beat Jump 16 Backward CH2</description>
+                <status>0x91</status>
+                <midino>0x61</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>beatjump_16_backward</key>
+                <description>Beat Jump 16 Backward CH3</description>
+                <status>0x92</status>
+                <midino>0x61</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>beatjump_16_backward</key>
+                <description>Beat Jump 16 Backward CH4</description>
+                <status>0x93</status>
+                <midino>0x61</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <!-- Beat Jump 16 beats forward CH1–4 (Shift + Right) -->
+            <control>
+                <group>[Channel1]</group>
+                <key>beatjump_16_forward</key>
+                <description>Beat Jump 16 Forward CH1</description>
+                <status>0x90</status>
+                <midino>0x62</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>beatjump_16_forward</key>
+                <description>Beat Jump 16 Forward CH2</description>
+                <status>0x91</status>
+                <midino>0x62</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>beatjump_16_forward</key>
+                <description>Beat Jump 16 Forward CH3</description>
+                <status>0x92</status>
+                <midino>0x62</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>beatjump_16_forward</key>
+                <description>Beat Jump 16 Forward CH4</description>
+                <status>0x93</status>
+                <midino>0x62</midino>
+                <options>
+                    <normal/>
+                </options>
+            </control>
+            <!-- Crossfader assign A/THRU/B CH1–4 -->
+            <control>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign A CH1</description>
+                <status>0x90</status>
+                <midino>0x16</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign THRU CH1</description>
+                <status>0x90</status>
+                <midino>0x1D</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel1]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign B CH1</description>
+                <status>0x90</status>
+                <midino>0x18</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign A CH2</description>
+                <status>0x91</status>
+                <midino>0x16</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign THRU CH2</description>
+                <status>0x91</status>
+                <midino>0x1D</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel2]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign B CH2</description>
+                <status>0x91</status>
+                <midino>0x18</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign A CH3</description>
+                <status>0x92</status>
+                <midino>0x16</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign THRU CH3</description>
+                <status>0x92</status>
+                <midino>0x1D</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel3]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign B CH3</description>
+                <status>0x92</status>
+                <midino>0x18</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign A CH4</description>
+                <status>0x93</status>
+                <midino>0x16</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign THRU CH4</description>
+                <status>0x93</status>
+                <midino>0x1D</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Channel4]</group>
+                <key>PioneerDDJFLX10.crossfaderAssign</key>
+                <description>Crossfader Assign B CH4</description>
+                <status>0x93</status>
+                <midino>0x18</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <!-- Sound Color FX — exclusive toggle, applies to all channels via QuickEffect -->
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: Space (Reverb)</description>
+                <status>0x96</status>
+                <midino>0x00</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: D. Echo (Echo)</description>
+                <status>0x96</status>
+                <midino>0x01</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: Crush (Bitcrusher)</description>
+                <status>0x96</status>
+                <midino>0x02</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: Pitch (Pitch Shift)</description>
+                <status>0x96</status>
+                <midino>0x03</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: Noise (White Noise)</description>
+                <status>0x96</status>
+                <midino>0x04</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.soundColorFx</key>
+                <description>Sound Color FX: Filter (Filter)</description>
+                <status>0x96</status>
+                <midino>0x05</midino>
+                <options>
+                    <script-binding/>
                 </options>
             </control>
         </controls>

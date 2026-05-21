@@ -1,11 +1,12 @@
 // -------------------------------------------------------------------
-// ------------------- DDJ-FLX10 script file v.1.0.1 -------------------
+// ------------------- DDJ-FLX10 script file v.1.0.5 -------------------
 // -------------------------------------------------------------------
 
 // *************************************************************************
 // * Mixxx mapping script file for the Pioneer DDJ-FLX10.
 // * Mostly adapted from the DDJ-1000 mapping script from Arnold Kalambani
 // * Author: Marc Zischka (Zim)
+// * Contributions: Victor Pineda (Veezuhz)
 // ****************************************************************************
 //
 //  Implemented (as per manufacturer's manual):
@@ -53,6 +54,18 @@
 
 //        * Keyshift mode
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// DISCLAIMER: These additions were developed alongside Claude Code in VSCode.
+// They are not part of the original mapping script and may not be fully tested.
+// Please review the code and test it thoroughly before using it in a live setting.
+//
+// Added Beatgrid nudge (Shift + Jog) - Veezuhz
+// Added Waveform zoom (Shift + CH rotary) - Veezuhz
+// Added Memory cue navigation (Shift + Hot Cue pads) - Veezuhz
+// Added Beat Jump and Beat Jump Size controls (Shift + CUE/LOOP CALL arrows) - Veezuhz
+// Added Sound Color FX controls (Shift + Pad FX1/2) - Veezuhz
+// Added Crossfader assign (A/THRU/B) per channel (Shift + Channel Fader) - Veezuhz
+// Updated LED policy for Play/Cue to be more Pioneer-like (Play ON when playing, Cue ON when paused on cue, both OFF at end of track or no track, Play blinks in standby) - Veezuhz
+// Added a diagnostic tool to scan BeatFX effects and print their index in the log (Shift + BeatFX ON) - Veezuhz
 
 // ─── TUNABLE PARAMETERS ──────────────────────────────────────────────────────
 // Jog scratch sensitivity: how many encoder intervals equal one vinyl revolution.
@@ -208,8 +221,9 @@ PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group
 
 // Waveform zoom — triggered by Shift+CH rotary (0xB6, CC 0x64).
 // Encoder uses two's complement: 1 = CW (zoom in), 127 = CCW (zoom out).
+// waveform_zoom=1 is most zoomed in; higher values zoom out. CW decreases value.
 PioneerDDJFLX10.waveformZoom = function(channel, control, value, status, group) {
-    var delta = value < 64 ? 1 : -1;
+    var delta = value < 64 ? -1 : 1;
     var zoom = engine.getValue(group, "waveform_zoom") + delta;
     engine.setValue(group, "waveform_zoom", Math.max(1, zoom));
 };
@@ -294,6 +308,7 @@ PioneerDDJFLX10.shiftHandler = function(channel, control, value, status, group) 
 
 // Whether the BeatFX ON button is currently active
 PioneerDDJFLX10._beatFxActive = false;
+PioneerDDJFLX10._beatFxFadeTimer = 0;
 
 // Last activated preset position (so ON button can re-apply it)
 PioneerDDJFLX10._lastPreset = null;
@@ -623,10 +638,35 @@ PioneerDDJFLX10.beatFxOnOff = function(channel, control, value, status, group) {
         PioneerDDJFLX10._beatFxScanStart();
         return;
     }
+    if (PioneerDDJFLX10._beatFxFadeTimer) {
+        engine.stopTimer(PioneerDDJFLX10._beatFxFadeTimer);
+        PioneerDDJFLX10._beatFxFadeTimer = 0;
+    }
     PioneerDDJFLX10._beatFxActive = !PioneerDDJFLX10._beatFxActive;
-
-    for (var s = 1; s <= 3; s++) {
-        engine.setValue("[EffectRack1_EffectUnit1_Effect" + s + "]", "enabled", PioneerDDJFLX10._beatFxActive ? 1 : 0);
+    var slot;
+    if (PioneerDDJFLX10._beatFxActive) {
+        for (slot = 1; slot <= 3; slot++) {
+            engine.setValue("[EffectRack1_EffectUnit1_Effect" + slot + "]", "enabled", 1);
+            engine.setValue("[EffectRack1_EffectUnit1_Effect" + slot + "]", "mix", 1.0);
+        }
+    } else {
+        // Fade mix to 0 over 750 ms (15 steps × 50 ms) so echo tails ring out naturally.
+        var fadeStep = 0;
+        var FADE_STEPS = 15;
+        PioneerDDJFLX10._beatFxFadeTimer = engine.beginTimer(50, function() {
+            fadeStep++;
+            var ratio = Math.max(0, 1.0 - fadeStep / FADE_STEPS);
+            for (var s = 1; s <= 3; s++) {
+                engine.setValue("[EffectRack1_EffectUnit1_Effect" + s + "]", "mix", ratio);
+            }
+            if (fadeStep >= FADE_STEPS) {
+                for (var s2 = 1; s2 <= 3; s2++) {
+                    engine.setValue("[EffectRack1_EffectUnit1_Effect" + s2 + "]", "enabled", 0);
+                }
+                engine.stopTimer(PioneerDDJFLX10._beatFxFadeTimer);
+                PioneerDDJFLX10._beatFxFadeTimer = 0;
+            }
+        });
     }
 };
 
@@ -655,6 +695,98 @@ PioneerDDJFLX10.beatFxChannelSelect = function(channel, control, value, status, 
     if (target) {
         engine.setValue("[EffectRack1_EffectUnit1]", "group_" + target + "_enable", 1);
     }
+};
+
+// Crossfader assign — A (left), THRU (center), B (right) per channel.
+// orientation: 0=A, 1=THRU, 2=B
+PioneerDDJFLX10._crossfaderNoteToOrientation = {
+    0x16: 0,  // A
+    0x1D: 1,  // THRU
+    0x18: 2   // B
+};
+
+PioneerDDJFLX10.crossfaderAssign = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var orientation = PioneerDDJFLX10._crossfaderNoteToOrientation[control];
+    if (orientation !== undefined) {
+        engine.setValue(group, "orientation", orientation);
+    }
+};
+
+// Sound Color FX — exclusive toggle across all 4 channels via QuickEffect.
+// Preset indices match the "Quick Effect Chain Presets" list order in Mixxx settings.
+PioneerDDJFLX10._colorFxActive = -1;
+PioneerDDJFLX10._colorFxChannels = ["[Channel1]", "[Channel2]", "[Channel3]", "[Channel4]"];
+PioneerDDJFLX10._colorFxNoteToPreset = {
+    0: 17,  // Space   → Reverb
+    1: 10,  // D. Echo → Echo
+    2: 8,   // Crush   → Bitcrusher
+    3: 16,  // Pitch   → Pitch Shift
+    4: 19,  // Noise   → White Noise
+    5: 11   // Filter  → Filter
+};
+
+PioneerDDJFLX10.soundColorFx = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var channels = PioneerDDJFLX10._colorFxChannels;
+    var i;
+    if (PioneerDDJFLX10._colorFxActive === control) {
+        for (i = 0; i < channels.length; i++) {
+            engine.setValue("[QuickEffectRack1_" + channels[i] + "_Effect1]", "enabled", 0);
+        }
+        PioneerDDJFLX10._colorFxActive = -1;
+    } else {
+        var preset = PioneerDDJFLX10._colorFxNoteToPreset[control];
+        for (i = 0; i < channels.length; i++) {
+            engine.setValue("[QuickEffectRack1_" + channels[i] + "]", "loaded_chain_preset", preset);
+            engine.setValue("[QuickEffectRack1_" + channels[i] + "_Effect1]", "enabled", 1);
+            // Block each channel's knob immediately with a sentinel that no physical
+            // position can match, preventing any jump before the preset settles.
+            PioneerDDJFLX10._colorFxSoftTakeover[i + 1] = true;
+            PioneerDDJFLX10._colorFxSoftTakeoverTarget[i + 1] = -1;
+        }
+        // After 50 ms read each channel's actual settled super1 as the takeover target.
+        var chSnapshot = channels.slice();
+        engine.beginTimer(50, function() {
+            for (var j = 0; j < chSnapshot.length; j++) {
+                PioneerDDJFLX10._colorFxSoftTakeoverTarget[j + 1] = engine.getValue(
+                    "[QuickEffectRack1_" + chSnapshot[j] + "]", "super1"
+                );
+            }
+        }, true);
+        PioneerDDJFLX10._colorFxActive = control;
+    }
+};
+
+// Sound Color FX intensity knob — 14-bit absolute encoder, per-channel state.
+// CC 0x17 (MSB) arrives first; CC 0x37 (LSB) completes the pair and drives the write.
+// Keyed by deck number (1–4).
+PioneerDDJFLX10._colorFxKnobMSB      = {1: 63,   2: 63,   3: 63,   4: 63};
+PioneerDDJFLX10._colorFxKnobPosition = {1: 0.5,  2: 0.5,  3: 0.5,  4: 0.5};
+PioneerDDJFLX10._colorFxSoftTakeover = {1: false, 2: false, 3: false, 4: false};
+PioneerDDJFLX10._colorFxSoftTakeoverTarget = {1: -1, 2: -1, 3: -1, 4: -1};
+
+PioneerDDJFLX10.soundColorFxKnobMSB = function(channel, control, value, status, group) {
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    PioneerDDJFLX10._colorFxKnobMSB[deck] = value;
+};
+
+PioneerDDJFLX10.soundColorFxKnobLSB = function(channel, control, value, status, group) {
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    var position = (PioneerDDJFLX10._colorFxKnobMSB[deck] * 128 + value) / 16383.0;
+    var prev = PioneerDDJFLX10._colorFxKnobPosition[deck];
+    PioneerDDJFLX10._colorFxKnobPosition[deck] = position;
+
+    if (PioneerDDJFLX10._colorFxSoftTakeover[deck]) {
+        var target = PioneerDDJFLX10._colorFxSoftTakeoverTarget[deck];
+        if ((prev <= target && position >= target) || (prev >= target && position <= target)) {
+            PioneerDDJFLX10._colorFxSoftTakeover[deck] = false;
+        } else {
+            return;
+        }
+    }
+
+    engine.setValue("[QuickEffectRack1_[Channel" + deck + "]]", "super1", position);
 };
 
 // Function to expand playlists folder (currently disabled)
