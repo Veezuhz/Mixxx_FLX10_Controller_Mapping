@@ -66,6 +66,8 @@
 // Added Crossfader assign (A/THRU/B) per channel (Shift + Channel Fader) - Veezuhz
 // Updated LED policy for Play/Cue to be more Pioneer-like (Play ON when playing, Cue ON when paused on cue, both OFF at end of track or no track, Play blinks in standby) - Veezuhz
 // Added a diagnostic tool to scan BeatFX effects and print their index in the log (Shift + BeatFX ON) - Veezuhz
+// Fixed loop in/out but need to fine tune sensitivity (Shift + Loop In/Out). Half && Double work - Veezuhz
+
 
 // ─── TUNABLE PARAMETERS ──────────────────────────────────────────────────────
 // Jog scratch sensitivity: how many encoder intervals equal one vinyl revolution.
@@ -76,6 +78,10 @@ var SCRATCH_INTERVALS_PER_REV = 1500;
 // Jog pitch-bend divisor: how much a jog nudge shifts playback rate.
 // Higher = smaller nudge. Lower = larger nudge.
 var JOG_BEND_DIVISOR = 16;
+
+// Loop adjust step: samples moved per jog unit when in loop in/out adjust mode.
+// At 44.1 kHz, 100 samples ≈ 2.3 ms per minimum jog tick.
+var LOOP_ADJUST_STEP = 100;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Global variables
@@ -161,11 +167,24 @@ PioneerDDJFLX10.shutdown = function() {
 };
 
 // Jog Wheel Management
+PioneerDDJFLX10._loopAdjustMode = {1: null, 2: null, 3: null, 4: null};
+
 PioneerDDJFLX10.wheelTurn = function(channel, control, value, status, group) {
     var newValue = value - 64;
     var deckNumber = PioneerDDJFLX10._getDeckFromGroup(group);
     if (engine.isScratching(deckNumber)) {
         engine.scratchTick(deckNumber, newValue);
+    } else if (PioneerDDJFLX10._loopAdjustMode[deckNumber]) {
+        var mode = PioneerDDJFLX10._loopAdjustMode[deckNumber];
+        var ctrl = mode === "in" ? "loop_in" : "loop_out";
+        var total = engine.getValue(group, "track_samples");
+        if (total > 0) {
+            var pos = engine.getValue(group, "playposition") * total;
+            pos = Math.max(0, Math.min(total, pos + newValue * LOOP_ADJUST_STEP));
+            engine.setValue(group, "playposition", pos / total);
+            engine.setValue(group, ctrl, 1);
+            engine.setValue(group, ctrl, 0);
+        }
     } else {
         engine.setValue(group, 'jog', PioneerDDJFLX10.sensitivityMinimizer(newValue, JOG_BEND_DIVISOR));
     }
@@ -787,6 +806,48 @@ PioneerDDJFLX10.soundColorFxKnobLSB = function(channel, control, value, status, 
     }
 
     engine.setValue("[QuickEffectRack1_[Channel" + deck + "]]", "super1", position);
+};
+
+// Loop In / Halve and Loop Out / Double.
+// If a loop is already active: halve (In button) or double (Out button).
+// If no loop is active: set loop_in or loop_out as normal.
+PioneerDDJFLX10.loopInOrHalve = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    if (PioneerDDJFLX10._loopAdjustMode[deck]) {
+        PioneerDDJFLX10._loopAdjustMode[deck] = null;
+        return;
+    }
+    var key = engine.getValue(group, "loop_enabled") ? "loop_halve" : "loop_in";
+    engine.setValue(group, key, 1);
+    engine.setValue(group, key, 0);
+};
+
+PioneerDDJFLX10.loopOutOrDouble = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    if (PioneerDDJFLX10._loopAdjustMode[deck]) {
+        PioneerDDJFLX10._loopAdjustMode[deck] = null;
+        return;
+    }
+    var key = engine.getValue(group, "loop_enabled") ? "loop_double" : "loop_out";
+    engine.setValue(group, key, 1);
+    engine.setValue(group, key, 0);
+};
+
+// Loop point adjust mode — entered via Shift+LoopIn (0x4C) or Shift+LoopOut (0x4D).
+// While active, the jog wheel moves the selected loop point by seeking the playhead
+// and re-stamping loop_in / loop_out at the new position. Press again to exit.
+PioneerDDJFLX10.loopInAdjust = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    PioneerDDJFLX10._loopAdjustMode[deck] = PioneerDDJFLX10._loopAdjustMode[deck] === "in" ? null : "in";
+};
+
+PioneerDDJFLX10.loopOutAdjust = function(channel, control, value, status, group) {
+    if (value === 0) return;
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    PioneerDDJFLX10._loopAdjustMode[deck] = PioneerDDJFLX10._loopAdjustMode[deck] === "out" ? null : "out";
 };
 
 // Function to expand playlists folder (currently disabled)
