@@ -67,7 +67,11 @@
 // Updated LED policy for Play/Cue to be more Pioneer-like (Play ON when playing, Cue ON when paused on cue, both OFF at end of track or no track, Play blinks in standby) - Veezuhz
 // Added a diagnostic tool to scan BeatFX effects and print their index in the log (Shift + BeatFX ON) - Veezuhz
 // Fixed loop in/out but need to fine tune sensitivity (Shift + Loop In/Out). Half && Double work - Veezuhz
-
+//-----------will try to log updates moving forward by date and time for better tracking-------------------------
+// 5-22.945: Added tempo reset button management - Veezuhz
+// 5-22.945: Added time display mode management (elapsed vs remaining)- (shift+hot cue)  - Veezuhz
+// 5-22.945: Updated connectControl to makeConnection for better performance on high-frequency callbacks - Veezuhz
+// 5-22.945: Updated VuMeter to vu_meter
 
 // ─── TUNABLE PARAMETERS ──────────────────────────────────────────────────────
 // Jog scratch sensitivity: how many encoder intervals equal one vinyl revolution.
@@ -94,7 +98,6 @@ PioneerDDJFLX10._rateLSB = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10._jogTouches = {1: false, 2: false, 3: false, 4: false};
 PioneerDDJFLX10._jogLastValue = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10._reverseSlipActive = {1: false, 2: false, 3: false, 4: false};
-PioneerDDJFLX10._currentTimeMode = {1: 0, 2: 0, 3: 0, 4: 0}; // 0=Remaining, 1=Elapsed
 PioneerDDJFLX10._lastShiftPress = 0;
 PioneerDDJFLX10._playCueBlinkTimer = {};
 PioneerDDJFLX10._playCueBlinkState = {1: false, 2: false, 3: false, 4: false};
@@ -111,21 +114,23 @@ PioneerDDJFLX10._getDeckFromGroup = function(group) {
 
 // Initialization
 PioneerDDJFLX10.init = function(id) {
-    print("Pioneer DDJ-FLX10 PROD - Initialisation");
+    console.log("Pioneer DDJ-FLX10 PROD - Initialisation");
+    var initTimeMode = engine.getValue("[Controls]", "ShowDurationRemaining") !== 0 ? 0x7F : 0x00;
     // Plage de pitch par défaut (±16%)
     for (var i = 1; i <= 4; i++) {
         var grp = "[Channel" + i + "]";
         engine.setValue(grp, "rateRange", 0.16);
         // Connect VU meters
-        engine.connectControl(grp, "VuMeter", "PioneerDDJFLX10.LedVuMeterCH" + i);
+        engine.makeConnection(grp, "vu_meter", PioneerDDJFLX10["LedVuMeterCH" + i]);
         // Force off au démarrage pour éviter LEDs fantômes
         midi.sendShortMsg(0xB0 + (i - 1), 0x02, 0x00);
-        // Jog display: enable visibility then connect data callbacks
+        // Jog display: enable visibility, set time mode, then connect data callbacks
         midi.sendShortMsg(JOG_DISPLAY_NOTE, 0x5C + i, 0x00);
-        engine.connectControl(grp, "playposition", "PioneerDDJFLX10.jogMarker");
-        engine.connectControl(grp, "bpm",          "PioneerDDJFLX10.jogBpm");
-        engine.connectControl(grp, "rate",         "PioneerDDJFLX10.jogSpeed");
-        engine.connectControl(grp, "duration",     "PioneerDDJFLX10.jogDuration");
+        midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[i - 1], initTimeMode);
+        engine.makeConnection(grp, "playposition", PioneerDDJFLX10.jogMarker);
+        engine.makeConnection(grp, "bpm",          PioneerDDJFLX10.jogBpm);
+        engine.makeConnection(grp, "rate",         PioneerDDJFLX10.jogSpeed);
+        engine.makeConnection(grp, "duration",     PioneerDDJFLX10.jogDuration);
         // Seed duration cache so jogTime works immediately at init
         PioneerDDJFLX10._trackDuration[i] = engine.getValue(grp, "duration");
         // Push initial values so displays start at correct state, not hardware defaults
@@ -138,14 +143,16 @@ PioneerDDJFLX10.init = function(id) {
     // Using a timer rather than a playposition callback because Mixxx throttles
     // high-frequency CO callbacks on some builds and the timer is unconditional.
     engine.beginTimer(250, function() {
+        var showRemaining = engine.getValue("[Controls]", "ShowDurationRemaining") !== 0;
         for (var d = 1; d <= 4; d++) {
             var duration = PioneerDDJFLX10._trackDuration[d];
             if (!(duration > 0)) { continue; }
             var pos = engine.getValue("[Channel" + d + "]", "playposition");
             var idx = d - 1;
             var elapsed = pos * duration;
-            var min = Math.floor(elapsed / 60);
-            var sec = Math.floor(elapsed % 60);
+            var displayTime = showRemaining ? (duration - elapsed) : elapsed;
+            var min = Math.floor(displayTime / 60);
+            var sec = Math.floor(displayTime % 60);
             if (min > 127) { min = 127; }
             midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_MIN[idx], min);
             midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_SEC[idx], sec);
@@ -185,7 +192,7 @@ PioneerDDJFLX10._updateRate = function(deck) {
 
 // Shutdown
 PioneerDDJFLX10.shutdown = function() {
-    print("Pioneer DDJ-FLX10 PROD - Arrêt");
+    console.log("Pioneer DDJ-FLX10 PROD - Arrêt");
     
     // Turn off all LEDs
     for (var i = 1; i <= 4; i++) {
@@ -258,6 +265,7 @@ var _JOG_SPEED_MSB   = [0x18, 0x19, 0x1A, 0x1B];
 var _JOG_SPEED_LSB   = [0x38, 0x39, 0x3A, 0x3B];
 var _JOG_TIME_MIN    = [0x42, 0x44, 0x46, 0x48];
 var _JOG_TIME_SEC    = [0x43, 0x45, 0x47, 0x49];
+var _JOG_TIME_MODE   = [0x14, 0x15, 0x16, 0x17]; // Note on 0x9F: 0x00=elapsed, 0x7F=remaining (hardware renders minus sign)
 
 PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group) {
     var delta = value - 64;
@@ -333,7 +341,8 @@ PioneerDDJFLX10.jogDuration = function(value, group, control) {
     PioneerDDJFLX10._trackDuration[deck] = value;
 };
 
-// Elapsed time display: minutes and seconds sent as separate single-byte CCs.
+// Time display: minutes and seconds sent as separate single-byte CCs.
+// Respects [Controls]/ShowDurationRemaining: 0=elapsed, 1 or 2=remaining.
 // value is playposition (0–1) passed directly from the callback — do not re-read it.
 PioneerDDJFLX10.jogTime = function(value, group, control) {
     var deck = PioneerDDJFLX10._getDeckFromGroup(group);
@@ -341,8 +350,10 @@ PioneerDDJFLX10.jogTime = function(value, group, control) {
     var duration = PioneerDDJFLX10._trackDuration[deck];
     if (!(duration > 0)) { return; }
     var elapsed = value * duration;
-    var min = Math.floor(elapsed / 60);
-    var sec = Math.floor(elapsed % 60);
+    var showRemaining = engine.getValue("[Controls]", "ShowDurationRemaining") !== 0;
+    var displayTime = showRemaining ? (duration - elapsed) : elapsed;
+    var min = Math.floor(displayTime / 60);
+    var sec = Math.floor(displayTime % 60);
     if (min > 127) { min = 127; }
     midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_MIN[i], min);
     midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_SEC[i], sec);
@@ -506,18 +517,16 @@ PioneerDDJFLX10.RangeSelector = function(channel, control, value, status, group)
     engine.setValue(group, "rateRange", PioneerDDJFLX10._rateRanges[idx]);
 };
 
-// Time display mode management
+// Time display mode management — [Controls]/ShowDurationRemaining: 0=elapsed, 1=remaining, 2=both
 PioneerDDJFLX10.TimeTypeChange = function(channel, control, value, status, group) {
-    if (value === 0x7F) {
-        var deck = PioneerDDJFLX10._getDeckFromGroup(group);
-        PioneerDDJFLX10._currentTimeMode[deck] = (PioneerDDJFLX10._currentTimeMode[deck] + 1) % 2;
-        PioneerDDJFLX10._updateTimeMode(group, deck);
+    if (value !== 0x7F) { return; }
+    var current = engine.getValue("[Controls]", "ShowDurationRemaining");
+    var newMode = current === 0 ? 1 : 0;
+    engine.setValue("[Controls]", "ShowDurationRemaining", newMode);
+    var hwMode = newMode !== 0 ? 0x7F : 0x00;
+    for (var d = 0; d < 4; d++) {
+        midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[d], hwMode);
     }
-};
-
-PioneerDDJFLX10._updateTimeMode = function(group, deck) {
-    var timeMode = PioneerDDJFLX10._currentTimeMode[deck];
-    engine.setValue(group, "show_seconds_elapsed", timeMode === 1);
 };
 
 // Tempo reset button management
@@ -674,11 +683,11 @@ PioneerDDJFLX10._renderAdvanced = function(deck){
 
 PioneerDDJFLX10._connectAdvanced = function(deck){
   var g = "[Channel"+deck+"]";
-  engine.connectControl(g, "play_indicator", function(v){
+  engine.makeConnection(g, "play_indicator", function(v){
     PioneerDDJFLX10._adv[deck].play = (v>=0.5)?1:0;
     PioneerDDJFLX10._renderAdvanced(deck);
   });
-  engine.connectControl(g, "cue_indicator", function(v){
+  engine.makeConnection(g, "cue_indicator", function(v){
     PioneerDDJFLX10._adv[deck].cue = (v>=0.5)?1:0;
     PioneerDDJFLX10._renderAdvanced(deck);
   });
@@ -722,23 +731,23 @@ PioneerDDJFLX10._beatFxScanStart = function() {
     if (PioneerDDJFLX10._scanTimer) {
         engine.stopTimer(PioneerDDJFLX10._scanTimer);
         PioneerDDJFLX10._scanTimer = null;
-        print("BeatFX Scan: stopped.");
+        console.log("BeatFX Scan: stopped.");
         return;
     }
     var g = "[EffectRack1_EffectUnit1_Effect1]";
     for (var i = 0; i < 30; i++) { engine.setValue(g, "effect_selector", -1); }
     PioneerDDJFLX10._scanIdx = 0;
-    print("BeatFX Scan: started — watch this Log tab + the FX panel");
-    print("BeatFX Scan: Index 0");
+    console.log("BeatFX Scan: started — watch this Log tab + the FX panel");
+    console.log("BeatFX Scan: Index 0");
 
     PioneerDDJFLX10._scanTimer = engine.beginTimer(2500, function() {
         PioneerDDJFLX10._scanIdx++;
         engine.setValue("[EffectRack1_EffectUnit1_Effect1]", "effect_selector", 1);
-        print("BeatFX Scan: Index " + PioneerDDJFLX10._scanIdx);
+        console.log("BeatFX Scan: Index " + PioneerDDJFLX10._scanIdx);
         if (PioneerDDJFLX10._scanIdx >= 25) {
             engine.stopTimer(PioneerDDJFLX10._scanTimer);
             PioneerDDJFLX10._scanTimer = null;
-            print("BeatFX Scan: complete.");
+            console.log("BeatFX Scan: complete.");
         }
     });
 };
