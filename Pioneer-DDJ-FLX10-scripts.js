@@ -101,6 +101,7 @@ PioneerDDJFLX10._playCueBlinkState = {1: false, 2: false, 3: false, 4: false};
 PioneerDDJFLX10._playCueShouldBlink = {1: false, 2: false, 3: false, 4: false};
 PioneerDDJFLX10._cuePressed = {1: false, 2: false, 3: false, 4: false};
 PioneerDDJFLX10._playShouldBlink = {1: false, 2: false, 3: false, 4: false};
+PioneerDDJFLX10._trackDuration = {1: 0, 2: 0, 3: 0, 4: 0};
 
 // Utility function to extract deck number from group
 PioneerDDJFLX10._getDeckFromGroup = function(group) {
@@ -113,17 +114,46 @@ PioneerDDJFLX10.init = function(id) {
     print("Pioneer DDJ-FLX10 PROD - Initialisation");
     // Plage de pitch par défaut (±16%)
     for (var i = 1; i <= 4; i++) {
-        engine.setValue("[Channel" + i + "]", "rateRange", 0.16);
+        var grp = "[Channel" + i + "]";
+        engine.setValue(grp, "rateRange", 0.16);
         // Connect VU meters
-        engine.connectControl("[Channel" + i + "]", "VuMeter", "PioneerDDJFLX10.LedVuMeterCH" + i);
+        engine.connectControl(grp, "VuMeter", "PioneerDDJFLX10.LedVuMeterCH" + i);
         // Force off au démarrage pour éviter LEDs fantômes
         midi.sendShortMsg(0xB0 + (i - 1), 0x02, 0x00);
+        // Jog display: enable visibility then connect data callbacks
+        midi.sendShortMsg(JOG_DISPLAY_NOTE, 0x5C + i, 0x00);
+        engine.connectControl(grp, "playposition", "PioneerDDJFLX10.jogMarker");
+        engine.connectControl(grp, "bpm",          "PioneerDDJFLX10.jogBpm");
+        engine.connectControl(grp, "rate",         "PioneerDDJFLX10.jogSpeed");
+        engine.connectControl(grp, "duration",     "PioneerDDJFLX10.jogDuration");
+        // Seed duration cache so jogTime works immediately at init
+        PioneerDDJFLX10._trackDuration[i] = engine.getValue(grp, "duration");
+        // Push initial values so displays start at correct state, not hardware defaults
+        PioneerDDJFLX10.jogMarker(engine.getValue(grp, "playposition"), grp, "playposition");
+        PioneerDDJFLX10.jogBpm(engine.getValue(grp, "bpm"), grp, "bpm");
+        PioneerDDJFLX10.jogSpeed(engine.getValue(grp, "rate"), grp, "rate");
+        PioneerDDJFLX10.jogTime(engine.getValue(grp, "playposition"), grp, "playposition");
     }
+    // Poll all four decks every 250 ms and push time to jog displays.
+    // Using a timer rather than a playposition callback because Mixxx throttles
+    // high-frequency CO callbacks on some builds and the timer is unconditional.
+    engine.beginTimer(250, function() {
+        for (var d = 1; d <= 4; d++) {
+            var duration = PioneerDDJFLX10._trackDuration[d];
+            if (!(duration > 0)) { continue; }
+            var pos = engine.getValue("[Channel" + d + "]", "playposition");
+            var idx = d - 1;
+            var elapsed = pos * duration;
+            var min = Math.floor(elapsed / 60);
+            var sec = Math.floor(elapsed % 60);
+            if (min > 127) { min = 127; }
+            midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_MIN[idx], min);
+            midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_SEC[idx], sec);
+        }
+    });
+
     // LEDs Play/Cue avancées (Pioneer-like)
     PioneerDDJFLX10._initAdvancedLeds();
-    
-    // Enable waveforms on startup
-    engine.setValue("[Skin]", "show_waveforms", 1);
 
     return true;
 };
@@ -217,6 +247,18 @@ PioneerDDJFLX10.wheelTouch = function(channel, control, value, status, group) {
 PioneerDDJFLX10._beatgridAccum = {1: 0, 2: 0, 3: 0, 4: 0};
 var BEATGRID_THRESHOLD = 6;
 
+// Jog wheel display — output on MIDI channel 16 (0xBF = CC, 0x9F = Note On)
+var JOG_DISPLAY_CC   = 0xBF;
+var JOG_DISPLAY_NOTE = 0x9F;
+var _JOG_MARKER_MSB  = [0x10, 0x11, 0x12, 0x13];
+var _JOG_MARKER_LSB  = [0x30, 0x31, 0x32, 0x33];
+var _JOG_BPM_MSB     = [0x14, 0x15, 0x16, 0x17];
+var _JOG_BPM_LSB     = [0x34, 0x35, 0x36, 0x37];
+var _JOG_SPEED_MSB   = [0x18, 0x19, 0x1A, 0x1B];
+var _JOG_SPEED_LSB   = [0x38, 0x39, 0x3A, 0x3B];
+var _JOG_TIME_MIN    = [0x42, 0x44, 0x46, 0x48];
+var _JOG_TIME_SEC    = [0x43, 0x45, 0x47, 0x49];
+
 PioneerDDJFLX10.beatgridAdjust = function(channel, control, value, status, group) {
     var delta = value - 64;
     if (delta === 0) return;
@@ -245,6 +287,65 @@ PioneerDDJFLX10.waveformZoom = function(channel, control, value, status, group) 
     var delta = value < 64 ? -1 : 1;
     var zoom = engine.getValue(group, "waveform_zoom") + delta;
     engine.setValue(group, "waveform_zoom", Math.max(1, zoom));
+};
+
+// ─── Jog wheel display ────────────────────────────────────────────────────────
+// All data is sent to MIDI channel 16 (0xBF for CC, 0x9F for Note On).
+// Protocol sourced from Loui1979 / community reverse-engineering of the FLX10.
+
+PioneerDDJFLX10._jogSend14 = function(msbCC, lsbCC, value14) {
+    midi.sendShortMsg(JOG_DISPLAY_CC, msbCC, (value14 >> 7) & 0x7F);
+    midi.sendShortMsg(JOG_DISPLAY_CC, lsbCC, value14 & 0x7F);
+};
+
+// Rotating marker: playposition (0–1) mapped to 0–359 degrees
+PioneerDDJFLX10.jogMarker = function(value, group, control) {
+    var i = PioneerDDJFLX10._getDeckFromGroup(group) - 1;
+    var deg = Math.round(value * 359);
+    if (deg < 0) { deg = 0; }
+    if (deg > 359) { deg = 359; }
+    PioneerDDJFLX10._jogSend14(_JOG_MARKER_MSB[i], _JOG_MARKER_LSB[i], deg);
+};
+
+// BPM display: bpm * 10 as a 14-bit integer
+PioneerDDJFLX10.jogBpm = function(value, group, control) {
+    var i = PioneerDDJFLX10._getDeckFromGroup(group) - 1;
+    var bpm10 = Math.round(value * 10);
+    if (bpm10 < 0) { bpm10 = 0; }
+    if (bpm10 > 16383) { bpm10 = 16383; }
+    PioneerDDJFLX10._jogSend14(_JOG_BPM_MSB[i], _JOG_BPM_LSB[i], bpm10);
+};
+
+// Speed display: rate (-1..+1) → centered at 0% → (rate*100+100)*10, 14-bit
+PioneerDDJFLX10.jogSpeed = function(value, group, control) {
+    var i = PioneerDDJFLX10._getDeckFromGroup(group) - 1;
+    var pct10 = Math.round((value * 100 + 100) * 10);
+    if (pct10 < 0) { pct10 = 0; }
+    if (pct10 > 16383) { pct10 = 16383; }
+    PioneerDDJFLX10._jogSend14(_JOG_SPEED_MSB[i], _JOG_SPEED_LSB[i], pct10);
+};
+
+// Cache track duration when it changes (new track loaded).
+// jogTime reads from this cache instead of calling engine.getValue("duration")
+// on every playposition tick, which can return 0 mid-callback on some systems.
+PioneerDDJFLX10.jogDuration = function(value, group, control) {
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    PioneerDDJFLX10._trackDuration[deck] = value;
+};
+
+// Elapsed time display: minutes and seconds sent as separate single-byte CCs.
+// value is playposition (0–1) passed directly from the callback — do not re-read it.
+PioneerDDJFLX10.jogTime = function(value, group, control) {
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    var i = deck - 1;
+    var duration = PioneerDDJFLX10._trackDuration[deck];
+    if (!(duration > 0)) { return; }
+    var elapsed = value * duration;
+    var min = Math.floor(elapsed / 60);
+    var sec = Math.floor(elapsed % 60);
+    if (min > 127) { min = 127; }
+    midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_MIN[i], min);
+    midi.sendShortMsg(JOG_DISPLAY_CC, _JOG_TIME_SEC[i], sec);
 };
 
 // Sensitivity functions
