@@ -6,15 +6,15 @@ Mixxx controller mapping for the Pioneer DDJ-FLX10 (v1.0.1).
 ## Files explanation
 
 There are 3 files that need to go into you Mixxx controller folder.
-   * Pioneer-DDJ-FLX10-scripts.js
-   * Pioneer-DDJ-FLX10-midi.xml
-   * common-controllelr-scripts.js
+   * `Pioneer-DDJ-FLX10-scripts.js`
+   * `Pioneer-DDJ-FLX10-midi.xml`
+   * `common-controllelr-scripts.js`
 
-File: 'flx10_unlock_v2.py' is meant for linux users. 
+File: `flx10_unlock_v2.py` is meant for linux users. 
 I ran into an issue where the jogwheels would only show 'no audio driver'. I had to try and reverse engineer the handshake between pioneer settings utility and the flx10. The steps for this are:
    1. connect flx10
-   2. run 'pkill -f mixxx 2>/dev/null' --this is to close mixxx
-   3. run  'sudo python3 ~/Downloads/flx10_unlock_v2.py' --running python script
+   2. run `pkill -f mixxx 2>/dev/null` --this is to close mixxx
+   3. run  `sudo python3 ~/Downloads/flx10_unlock_v2.py` --running python script
    4. This should unlock your flx10 and you wont need to do this again until you unplug/plug back in (reconnect)
 
 Sidenotes: yes... I'm sorry.. this has to be done every startup so keep note that this needs to be done with mixxx closed. I hope someone can create a working .sh for this.
