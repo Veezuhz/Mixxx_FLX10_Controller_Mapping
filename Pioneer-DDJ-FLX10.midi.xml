@@ -4056,13 +4056,13 @@
                 </options>
             </control>
             <control>
-                <group>[Library]</group>
-                <key>MoveFocusForward</key>
-                <description>CHANGE FOCUS TO RIGHT CH_ALL</description>
+                <group>[Master]</group>
+                <key>maximize_library</key>
+                <description>Toggle library/waveform view (View button)</description>
                 <status>0x96</status>
                 <midino>0x7A</midino>
                 <options>
-                    <normal/>
+                    <toggle/>
                 </options>
             </control>
             <!-- Beat Jump 4 beats backward CH1–4 -->
