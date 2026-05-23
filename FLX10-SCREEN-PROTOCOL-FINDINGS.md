@@ -1,6 +1,17 @@
 # DDJ-FLX10 Jog Wheel Screen Protocol — Findings & Open Problem
 
-**Status (May 2026):** Wire protocol thoroughly decoded from both rekordbox and VirtualDJ captures. **No HID screen feature renders on Linux** despite the device acking every packet we send. We have hit an undocumented device-state gate that we cannot reproduce.
+**Status (2026-05-23 evening):** **BREAKTHROUGH** — jog wheel LCDs render for the first time when we send `03 01` SysEx one-shot + `50 31` Serato-flavor keepalive on MIDI OUT, then drive screen data on EP5 HID. The lights come on and the deck-info text appears ("no track loaded" placeholder shown — meaning the firmware is rendering, just not satisfied with our `xx 21` metadata content). All earlier negative results were because we were polling rekordbox's `50 00` keepalive flavor instead of `50 31`.
+
+```bash
+# Confirmed working invocation:
+sudo python3 flx10_unlock_v2.py
+sudo python3 "DDJ-FLX10 Screen Protocol/flx10_rekordbox_proto.py" --deck 2 --sysex-flavor serato
+```
+
+**Remaining gaps:**
+1. Metadata is read as "no track loaded" — either our `xx 21` byte layout is still off, or after the Serato-flavor handshake the firmware expects Serato's `xx 27` instead of `xx 21`.
+2. Waveform upload behavior post-handshake is unverified; the `xx 2C / xx 2E` data we sent may have been ignored for the same reason as metadata.
+3. Need to isolate whether `03 01` alone, `50 31` alone, or the combination is the actual gate (experiments A/B below).
 
 This document is the canonical "where we are" for a fresh contributor. It supersedes the earlier `DDJ-FLX10 Screen Protocol/FLX10-SCREEN-PROTOCOL-INVESTIGATION.md` (kept for history) and complements [`FLX10-INTEGRATION-NOTES.md`](FLX10-INTEGRATION-NOTES.md).
 
@@ -111,17 +122,30 @@ Implemented in [`flx10_unlock_v2.py`](flx10_unlock_v2.py). On Linux these put au
 
 Windows HID class driver sends `SET_IDLE` to interface 5. The FLX10 STALLs it. The Windows driver ignores the STALL and continues. Our pyusb test scripts also send it and get the same STALL. **Not the gate.**
 
-### MIDI SysEx polling — sent before screen writes
+### MIDI SysEx — three flavors across three apps
 
-Present in the rekordbox full-init capture at t=56.18s..56.99s, **5 identical messages at ~200ms intervals on MIDI OUT (EP3)** before the first heartbeat on EP5:
+AlphaTheta SysEx manufacturer ID is `00 40 05`. The byte at index 8 (after `F0 00 40 05 00 00 04 01`) is the opcode. The three apps we captured use overlapping but distinct sets:
 
+| Pattern | rekordbox | VirtualDJ | Serato | Frequency |
+|---------|-----------|-----------|--------|-----------|
+| `F0 00 40 05 00 00 04 01 00 03 01 F7` | ❌ | ✅ once | ✅ once | one-shot before first screen write |
+| `F0 00 40 05 00 00 04 01 00 50 00 F7` | ✅ poll | ✅ once | ❌ | rekordbox keepalive (~200ms) |
+| `F0 00 40 05 00 00 04 01 00 50 31 F7` | ❌ | ❌ | ✅ poll | Serato keepalive (~250ms) |
+| `F0 00 20 7F 01 02 01 01 22 0F 0C 06 08 04 0A 02 ... F7` | ❌ | ❌ | ✅ once | Stanton/Serato app identification |
+| `F0 00 40 05 00 00 04 01 11/12/13/14 00 ...` | ❌ | ❌ | ✅ live | Serato deck-specific (11=deck 1 etc.) |
+| `F0 00 40 05 00 00 04 01 00 00 0B 31 ...` | ✅ track-load | ❌ | ✅ track-load | track-load events |
+| `F0 00 40 05 00 00 04 01 00 00 0C 00 ...` | ✅ track-load | ❌ | ✅ track-load | track-load events |
+
+**Key finding: `03 01` is sent by both apps where the screen renders (VirtualDJ on Linux replay would, Serato on Windows does), but NOT by rekordbox.** Rekordbox uses xx 3D heartbeats + the `50 00` keepalive instead. The two apps that send `03 01` happen to also be the ones whose screen-render pipelines we never directly observed on Linux.
+
+The user previously tested `03 01` via `amidi -S` in isolation and "nothing changed," but that test wasn't followed by the screen-data flow it precedes in the captures. As of 2026-05-23, `flx10_rekordbox_proto.py` sends `03 01` once at startup before the keepalive poll begins; rerunning with that script is the next concrete test.
+
+Run options on `flx10_rekordbox_proto.py`:
 ```
-F0 00 40 05 00 00 04 01 00 50 00 F7
+sudo python3 flx10_rekordbox_proto.py --deck 2                                # default: 03 01 once + 50 00 poll + rekordbox protocol
+sudo python3 flx10_rekordbox_proto.py --deck 2 --sysex-flavor serato          # use 50 31 poll instead
+sudo python3 flx10_rekordbox_proto.py --deck 2 --no-sysex-enter               # skip the 03 01 (control test)
 ```
-
-`00 40 05` is the AlphaTheta SysEx manufacturer ID. Larger SysEx messages also appear during track-load events (`... 00 00 0B 31 ...`, `... 00 00 0C 00 00 02 0E 0E ...`).
-
-Tested via `amidi -p hw:4,0,0 -S "F0 00 40 05 00 00 04 01 00 50 00 F7"`. The current rekordbox-proto test script sends this poll continuously in a background thread. **No visible change.**
 
 ### `00 3D` — Broadcast heartbeat (rekordbox)
 
@@ -197,6 +221,40 @@ Rate: **150 entries per second of audio.** rekordbox sent 946 such packets for d
 ```
 
 30 × 122 / 3 = 1220 entries per upload. VirtualDJ sent it **twice** (two bursts of 30 packets), which was a key correction to our initial implementation.
+
+### `xx 27` — Per-deck state (Serato)
+
+Serato's equivalent of `xx 21`. Sent constantly per deck — ~1420 packets per deck in the captured session.
+
+```
+[0]=deck  [1]=27  [2]=b4 (constant)  [3]=80 (constant)  [4]=01 (loaded?)
+[5..14]   mostly zero, occasional state bytes
+[16]      0x0e — activity flag
+[21]      0x80 (constant)
+[25]      0x80 (constant)
+[26]      0x0d (constant)
+[27]      sub-state per deck
+[28..30]  ff ff ff (white?)
+```
+
+**Serato does NOT send `xx 21` at all.** It uses `xx 27` instead.
+
+### `xx 36` — Waveform detail (Serato)
+
+Serato's waveform format. Same PWV5 LE16 encoding as rekordbox's `xx 2E` but a different framing:
+
+```
+[0]=deck  [1]=36  [2]=seg  [3]=sub  [4]=01  [5]=00
+[6]=0x13 (= 19, entries per packet?)
+[7]=00
+[8..11]   LE32 position counter (increments by ~18 between packets)
+[12..13]  00 00
+[14..127] up to ~19 PWV5 LE16 entries (38 bytes), rest zero-padded
+```
+
+Capture shows Serato sent ~420-490 `xx 36` packets per deck. Position counter starts at 0 and walks forward; values like 0x12, 0x25, 0x37 in consecutive packets suggest ~18 entries advance per packet.
+
+**Serato does NOT send `xx 2C` overview, `xx 2E` waveform, `xx 37/38` waveform, or `xx 3D` heartbeat.** Pure `xx 27` + `xx 36` + a few small commands (`xx 33`, `xx 2F`, `xx 30`, `xx 35`, `xx 39`).
 
 ### `xx 38` — Waveform detail 3-band (VirtualDJ)
 
@@ -292,14 +350,20 @@ We have replicated all of this (unlock + audio + SysEx + heartbeat + xx 21 + xx 
 | SET_IDLE to iface 5 | both | STALLs (expected) |
 | 7-command vendor unlock | `flx10_unlock_v2.py` | unlocks audio; no screen effect |
 | EP1 OUT silent-audio stream | aplay subprocess in test script | no screen effect |
-| SysEx polling on MIDI | amidi thread in test script | no screen effect |
+| SysEx polling on MIDI (50 00 rekordbox flavor) | amidi thread in test script | no screen effect |
 | `xx D0/D1/D7` static JPEG background | `flx10_set_background.py` | **no render, 0 ACKs** |
+| `03 01` SysEx one-shot (standalone via amidi) | `amidi -S` | no immediate visible effect |
+| `03 01` one-shot + rekordbox `50 00` keepalive + rk protocol | `flx10_rekordbox_proto.py` default | no render |
+| `03 01` one-shot + **Serato `50 31` keepalive** + rk protocol | `--sysex-flavor serato` | ✅ **JOG WHEEL LCDS LIGHT UP — first time anything rendered.** Deck text shows "no track loaded" — metadata not yet honored |
+| Serato `xx 27/36` protocol with same SysEx handshake | not yet implemented | next test |
 
 ---
 
 ## The remaining hypothesis
 
-Every protocol layer visible on the wire has been reproduced. The fact that even the simplest HID screen feature (static background image) does not render means the gate is **device-side, not protocol-side**.
+The most concrete current lead is the `03 01` SysEx, present in Serato and VirtualDJ but absent from rekordbox. The user has tested `03 01` standalone (`amidi -S`) and seen no immediate effect, but never tested it as the precursor to a screen-data flow. The updated `flx10_rekordbox_proto.py` now sends `03 01` once at startup before the rest of the protocol. **Re-running this script is the priority test before drawing further conclusions.**
+
+If that still doesn't render: every protocol layer visible on the wire has been reproduced and the gate is **device-side, not protocol-side**.
 
 The remaining candidates, in order of likelihood:
 

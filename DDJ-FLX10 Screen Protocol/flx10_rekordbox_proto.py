@@ -151,6 +151,13 @@ class HeartbeatThread(threading.Thread):
 
 SYSEX_PING = "F0 00 40 05 00 00 04 01 00 50 00 F7"
 
+# One-shot "enter HID screen mode" SysEx — present in VirtualDJ and Serato
+# captures BEFORE their first screen write, but absent from rekordbox.
+# rekordbox doesn't need it because rekordbox uses xx 3D heartbeats which appear
+# to enable a different mode.  Serato's variant of the keepalive (50 31) instead
+# of rekordbox's 50 00 also suggests these opcodes select firmware behaviors.
+SYSEX_ENTER_HID = "F0 00 40 05 00 00 04 01 00 03 01 F7"
+
 
 def find_flx10_midi_port():
     """Return the amidi port name for the FLX10 (e.g. 'hw:4,0,0'), or None."""
@@ -237,6 +244,119 @@ def metadata_burst(ep_out, loaded_deck, cycles=20, interval_s=0.02, playing=Fals
                           track_loaded=(d == loaded_deck),
                           playing=(playing and d == loaded_deck))
         time.sleep(interval_s)
+
+
+# ---------------------------------------------------------------------------
+# Serato xx 27 — Per-deck state ping (replaces xx 21 in Serato's protocol)
+# ---------------------------------------------------------------------------
+#
+# Decoded from /home/vpinedax/Downloads/flx10-driverrutil-then-serato.pcapng.
+# byte[27] differs per deck (deck 1=0x02, deck 2=0x01, deck 3=0x04, deck 4=0x03 guessed).
+
+_SERATO_DECK_BYTE_27 = {0x10: 0x02, 0x20: 0x01, 0x30: 0x04, 0x40: 0x03}
+
+
+def _make_serato_state_pkt(deck_byte, track_loaded=True):
+    # Verified byte positions from Serato capture.  Minimum non-empty packet:
+    # [0..4] common + [20]=0e + [25]=80 + [29]=80 + [30]=0d + [31]=deck-state
+    # + [32..34]=ff ff ff.
+    # When track_loaded=True we set [16,17]=b0 ff which makes the timer
+    # appear (with placeholder duration); this is observed but does NOT make
+    # the "loaded" text appear.  Track-name text is likely driven by xx 33
+    # (JPEG) or xx 39 (ASCII), not by anything in xx 27.
+    pkt = bytearray(128)
+    pkt[0]  = deck_byte
+    pkt[1]  = 0x27
+    pkt[2]  = 0xb4
+    pkt[3]  = 0x80
+    pkt[4]  = 0x01
+    if track_loaded:
+        pkt[16] = 0xb0
+        pkt[17] = 0xff
+    pkt[20] = 0x0e
+    pkt[25] = 0x80
+    pkt[29] = 0x80
+    pkt[30] = 0x0d
+    pkt[31] = _SERATO_DECK_BYTE_27.get(deck_byte, 0x02)
+    pkt[32] = 0xff
+    pkt[33] = 0xff
+    pkt[34] = 0xff
+    return pkt
+
+
+def send_serato_state(ep_out, deck, track_loaded=True):
+    db = DECK_BYTES.get(deck)
+    if not db:
+        return
+    send_pkt(ep_out, _make_serato_state_pkt(db, track_loaded))
+
+
+def serato_state_burst(ep_out, loaded_deck, cycles=20, interval_s=0.02):
+    print(f"Sending {cycles} Serato xx 27 state cycles (deck {loaded_deck} = loaded) …")
+    for _ in range(cycles):
+        for d in range(1, 5):
+            send_serato_state(ep_out, d, track_loaded=(d == loaded_deck))
+        time.sleep(interval_s)
+
+
+# ---------------------------------------------------------------------------
+# Serato xx 36 — Waveform (PWV5 LE16, Serato framing)
+# ---------------------------------------------------------------------------
+#
+# Same PWV5 encoding as rekordbox xx 2E but different framing:
+#   [0]=deck  [1]=36  [2]=seg  [3]=sub  [4]=01  [5]=00
+#   [6]=0x13 (=19, entries per packet)  [7]=00
+#   [8..11] LE32 entry-position counter (increments by ~18 between packets)
+#   [12..13] 00 00
+#   [14..127] up to 19 PWV5 LE16 entries (38 bytes), rest zero-padded
+
+def upload_serato_waveform(ep_out, deck, duration_sec):
+    # Verified packet layout from capture:
+    #   [0]=deck [1]=36 [2]=seg [3]=sub [4]=01 [5]=00 [6]=0x13 [7..9]=00
+    #   [10..13] = LE32 entry-position counter
+    #   [14..] = PWV5 LE16 entries (~19 per packet, 38 bytes)
+    # Counter increments: pkt0=0, pkt1=18, pkt2=37, pkt3=56 — i.e. +19 except
+    # the first transition is +18. Matched here by sending 18 entries in pkt 0
+    # and 19 in every subsequent pkt.
+    db = DECK_BYTES[deck]
+    entries_bytes = _generate_pwv5_entries(duration_sec)
+    n_entries = len(entries_bytes) // 2
+
+    pos = 0           # entry index of first entry in this packet
+    seg = 1
+    sub = 0
+    total = 0
+    is_first = True
+    while pos < n_entries:
+        take = (18 if is_first else 19)
+        take = min(take, n_entries - pos)
+        is_first = False
+
+        pkt = bytearray(128)
+        pkt[0] = db
+        pkt[1] = 0x36
+        pkt[2] = seg
+        pkt[3] = sub
+        pkt[4] = 0x01
+        pkt[5] = 0x00
+        pkt[6] = 0x13
+        # bytes [7..9] stay zero
+        pkt[10] =  pos        & 0xFF
+        pkt[11] = (pos >> 8)  & 0xFF
+        pkt[12] = (pos >> 16) & 0xFF
+        pkt[13] = (pos >> 24) & 0xFF
+        nbytes = take * 2
+        for j in range(nbytes):
+            pkt[14 + j] = entries_bytes[pos * 2 + j]
+        send_pkt(ep_out, pkt)
+        pos += take
+        seg += 1
+        total += 1
+        if seg > 255:
+            seg = 1
+            sub += 1
+    print(f"Waveform (xx 36 Serato): sent {total} packets, "
+          f"{n_entries} entries ({duration_sec:.1f}s) to deck {deck}")
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +520,22 @@ def main():
                          "By default we pump silence to EP1 because rekordbox's full-init capture "
                          "shows audio starts ~50s before any screen write — likely a precondition.")
     ap.add_argument("--no-sysex", action="store_true",
-                    help="Skip the MIDI SysEx polling (`50 00` ping every 200ms) that rekordbox "
-                         "sends before its first screen write.")
+                    help="Skip the MIDI SysEx layer entirely.")
+    ap.add_argument("--no-sysex-enter", action="store_true",
+                    help="Skip just the one-shot `03 01` SysEx (the Serato/VirtualDJ enter-HID candidate). "
+                         "Keepalive polling still runs unless --no-sysex is also set.")
+    ap.add_argument("--sysex-flavor", choices=["rekordbox", "serato"], default="rekordbox",
+                    help="Which keepalive variant to poll: rekordbox=50 00, serato=50 31. "
+                         "Default rekordbox. (Note: 50 31 is what made the LCDs light up on 2026-05-23.)")
+    ap.add_argument("--protocol-flavor", choices=["rekordbox", "serato"], default="rekordbox",
+                    help="Which EP5 screen protocol to drive: "
+                         "rekordbox=xx 21 metadata + xx 2C overview + xx 2E PWV5 waveform + xx 3D heartbeat; "
+                         "serato=xx 27 state + xx 36 PWV5 waveform (no overview, no heartbeat). "
+                         "Match this to --sysex-flavor for the cleanest test.")
     args = ap.parse_args()
+    global SYSEX_PING
+    if args.sysex_flavor == "serato":
+        SYSEX_PING = "F0 00 40 05 00 00 04 01 00 50 31 F7"
 
     dev = find_device()
     detached = False
@@ -434,13 +567,28 @@ def main():
     audio_proc = None
     sysex = None
 
-    # ===== Phase 0a: start MIDI SysEx polling (rekordbox sends this first) ==
+    # ===== Phase 0a: MIDI SysEx handshake ===================================
+    # Two layers (controlled separately by --no-sysex-enter and --no-sysex):
+    #   1. ONE-SHOT `03 01` — sent by Serato AND VirtualDJ before any screen
+    #      writes.  Missing from rekordbox capture.  Candidate "enter HID
+    #      screen mode" magic.
+    #   2. KEEPALIVE polling of `50 00` (rekordbox flavor) or `50 31` (Serato
+    #      flavor) every 200-250 ms.
     if not args.no_sysex:
         midi_port = find_flx10_midi_port()
         if midi_port is None:
-            print("WARNING: FLX10 MIDI port not found in `amidi -l`, skipping SysEx ping")
+            print("WARNING: FLX10 MIDI port not found in `amidi -l`, skipping SysEx layer")
         else:
-            print(f"\nPhase 0a: SysEx polling on {midi_port} every 200 ms …")
+            if not args.no_sysex_enter:
+                print(f"\nPhase 0a1: one-shot SysEx 03 01 on {midi_port} (enter-HID candidate)")
+                try:
+                    subprocess.run(["amidi", "-p", midi_port, "-S", SYSEX_ENTER_HID],
+                                   check=False, timeout=1,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    print(f"  SysEx 03 01 send failed: {e}")
+                time.sleep(0.1)
+            print(f"\nPhase 0a2: SysEx keepalive on {midi_port} every 200 ms …")
             sysex = SysExPingThread(midi_port)
             sysex.start()
             time.sleep(1.2)   # 5+ pings, matching rekordbox's pre-heartbeat warm-up
@@ -464,41 +612,67 @@ def main():
                 print(f"  could not start aplay: {e}; continuing without audio")
 
     try:
-        # ===== Phase 1: heartbeats only (rekordbox warm-up) =================
-        print(f"\nPhase 1: heartbeats-only warm-up ({args.warmup:.1f}s) …")
-        hb = HeartbeatThread(ep_out)
-        hb.start()
-        time.sleep(args.warmup)
-        drain_acks(ep_in, count=10, label="post-warmup")
+        if args.protocol_flavor == "rekordbox":
+            # ===== Phase 1: heartbeats only (rekordbox warm-up) =================
+            print(f"\nPhase 1: rekordbox heartbeat warm-up ({args.warmup:.1f}s) …")
+            hb = HeartbeatThread(ep_out)
+            hb.start()
+            time.sleep(args.warmup)
+            drain_acks(ep_in, count=10, label="post-warmup")
 
-        # ===== Phase 2: metadata burst (all decks, ~20 cycles at 50 Hz) =====
-        print(f"\nPhase 2: metadata burst (deck {args.deck} loaded, "
-              f"{'playing' if args.playing else 'stopped'}) …")
-        metadata_burst(ep_out, loaded_deck=args.deck, cycles=20, playing=args.playing)
-        drain_acks(ep_in, count=10, label="post-metadata")
+            # ===== Phase 2: metadata burst =====
+            print(f"\nPhase 2: xx 21 metadata burst (deck {args.deck} loaded, "
+                  f"{'playing' if args.playing else 'stopped'}) …")
+            metadata_burst(ep_out, loaded_deck=args.deck, cycles=20, playing=args.playing)
+            drain_acks(ep_in, count=10, label="post-metadata")
 
-        # ===== Phase 3: overview upload =====================================
-        print(f"\nPhase 3: overview (xx 2C) upload to deck {args.deck} …")
-        upload_overview(ep_out, args.deck)
-        drain_acks(ep_in, count=10, label="post-overview")
+            # ===== Phase 3: overview upload =====
+            print(f"\nPhase 3: xx 2C overview upload to deck {args.deck} …")
+            upload_overview(ep_out, args.deck)
+            drain_acks(ep_in, count=10, label="post-overview")
 
-        # ===== Phase 4: waveform upload =====================================
-        print(f"\nPhase 4: waveform (xx 2E PWV5) upload, {args.duration:.1f}s …")
-        upload_waveform(ep_out, args.deck, args.duration)
-        drain_acks(ep_in, count=30, timeout_ms=200, label="post-waveform")
+            # ===== Phase 4: waveform upload =====
+            print(f"\nPhase 4: xx 2E PWV5 waveform upload, {args.duration:.1f}s …")
+            upload_waveform(ep_out, args.deck, args.duration)
+            drain_acks(ep_in, count=30, timeout_ms=200, label="post-waveform")
 
-        # ===== Phase 5: sustained metadata + heartbeats =====================
-        print(f"\nPhase 5: sustained metadata + heartbeats for {args.hold:.1f}s …")
-        print("        Watch the jog wheel now — waveform should appear if rendering works.")
-        end_t = time.time() + args.hold
-        while time.time() < end_t:
-            for d in range(1, 5):
-                send_metadata(ep_out, d,
-                              track_loaded=(d == args.deck),
-                              playing=(args.playing and d == args.deck))
-            time.sleep(0.02)
+            # ===== Phase 5: sustained metadata + heartbeats =====
+            print(f"\nPhase 5: sustained xx 21 + xx 3D for {args.hold:.1f}s …")
+            print("        Watch the jog wheel — waveform should appear if rendering works.")
+            end_t = time.time() + args.hold
+            while time.time() < end_t:
+                for d in range(1, 5):
+                    send_metadata(ep_out, d,
+                                  track_loaded=(d == args.deck),
+                                  playing=(args.playing and d == args.deck))
+                time.sleep(0.02)
+        else:
+            # ----- Serato protocol -------------------------------------------
+            # No xx 3D heartbeat, no xx 2C overview — Serato sends neither.
+            print(f"\nPhase 1: warm-up (no heartbeat for Serato flavor, {args.warmup:.1f}s) …")
+            time.sleep(args.warmup)
+            drain_acks(ep_in, count=10, label="post-warmup")
 
-        print("\n——— Done — heartbeats stopping ———")
+            # ===== Phase 2: Serato xx 27 state burst =====
+            print(f"\nPhase 2: xx 27 state burst (deck {args.deck} loaded) …")
+            serato_state_burst(ep_out, loaded_deck=args.deck, cycles=20)
+            drain_acks(ep_in, count=10, label="post-state")
+
+            # ===== Phase 3: Serato xx 36 waveform upload =====
+            print(f"\nPhase 3: xx 36 PWV5 waveform upload (Serato framing), {args.duration:.1f}s …")
+            upload_serato_waveform(ep_out, args.deck, args.duration)
+            drain_acks(ep_in, count=30, timeout_ms=200, label="post-waveform")
+
+            # ===== Phase 4: sustained state =====
+            print(f"\nPhase 4: sustained xx 27 state pings for {args.hold:.1f}s …")
+            print("        Watch the jog wheel — waveform should appear if rendering works.")
+            end_t = time.time() + args.hold
+            while time.time() < end_t:
+                for d in range(1, 5):
+                    send_serato_state(ep_out, d, track_loaded=(d == args.deck))
+                time.sleep(0.02)
+
+        print("\n——— Done — protocol stopping ———")
 
     finally:
         if hb is not None:
