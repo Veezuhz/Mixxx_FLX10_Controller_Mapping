@@ -162,6 +162,12 @@ PioneerDDJFLX10.init = function(id) {
     // LEDs Play/Cue avancées (Pioneer-like)
     PioneerDDJFLX10._initAdvancedLeds();
 
+    if (typeof PioneerDDJFLX10.screen !== "undefined") {
+        PioneerDDJFLX10.screen.start();
+    } else {
+        console.log("FLX10 screen: module not loaded — HID interface may be unavailable");
+    }
+
     return true;
 };
 
@@ -193,6 +199,9 @@ PioneerDDJFLX10._updateRate = function(deck) {
 // Shutdown
 PioneerDDJFLX10.shutdown = function() {
     console.log("Pioneer DDJ-FLX10 PROD - Arrêt");
+    if (typeof PioneerDDJFLX10.screen !== "undefined") {
+        PioneerDDJFLX10.screen.stop();
+    }
     
     // Turn off all LEDs
     for (var i = 1; i <= 4; i++) {
