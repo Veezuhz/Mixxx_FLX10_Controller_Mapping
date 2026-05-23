@@ -360,6 +360,79 @@ def upload_serato_waveform(ep_out, deck, duration_sec):
 
 
 # ---------------------------------------------------------------------------
+# Serato xx 33 — Album-art JPEG upload (also used by rekordbox)
+# ---------------------------------------------------------------------------
+#
+# Decoded from Serato capture (frame 8088 = empty placeholder JPEG, frame 24245
+# = actual album art).  Format:
+#   SEG 1: [0]=deck [1]=33 [2]=1 [3]=0 [4]=total_segs [5]=00
+#          [6..7]=jpeg_size_LE16 [8]=00 [9..127]=first 119B of JPEG
+#   SEG N: [0]=deck [1]=33 [2]=N [3]=0 [4]=total_segs [5]=00
+#          [6..127]=122B JPEG continuation
+
+def upload_album_art(ep_out, deck, jpeg_bytes):
+    db = DECK_BYTES[deck]
+    jpeg_size = len(jpeg_bytes)
+    SEG1_CAP = 119
+    SEG_CAP  = 122
+    if jpeg_size <= SEG1_CAP:
+        total_segs = 1
+    else:
+        total_segs = 1 + (jpeg_size - SEG1_CAP + SEG_CAP - 1) // SEG_CAP
+
+    pos = 0
+    for seg in range(1, total_segs + 1):
+        pkt = bytearray(128)
+        pkt[0] = db
+        pkt[1] = 0x33
+        pkt[2] = seg
+        pkt[3] = 0x00
+        pkt[4] = total_segs & 0xFF
+        pkt[5] = 0x00
+        if seg == 1:
+            pkt[6] = jpeg_size & 0xFF
+            pkt[7] = (jpeg_size >> 8) & 0xFF
+            pkt[8] = 0x00
+            take = min(SEG1_CAP, jpeg_size - pos)
+            for j in range(take):
+                pkt[9 + j] = jpeg_bytes[pos + j]
+            pos += take
+        else:
+            take = min(SEG_CAP, jpeg_size - pos)
+            for j in range(take):
+                pkt[6 + j] = jpeg_bytes[pos + j]
+            pos += take
+        send_pkt(ep_out, pkt)
+    print(f"Album art (xx 33): sent {total_segs} packets ({jpeg_size} bytes) to deck {deck}")
+
+
+def _generate_test_jpeg(size_px=32, color="red"):
+    """Tiny JPEG for testing xx 33.  Uses PIL if available, else falls back to
+    a known-good 1×1 JPEG hardcoded below."""
+    try:
+        from PIL import Image
+        import io
+        img = Image.new("RGB", (size_px, size_px), color)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=70)
+        return buf.getvalue()
+    except ImportError:
+        # Minimal 1×1 red JPEG (~134 bytes), generated offline
+        import binascii
+        return binascii.unhexlify(
+            "ffd8ffe000104a46494600010101006000600000ffdb00430008060607060508"
+            "0707080908080a0d160e0d0c0c0d1c14150e15181e1f1e1819171a212a25211f"
+            "281a17172e2f2c282c322c2e2c34302c2c2c2c2cffdb004301090a0a0d0c0d1a"
+            "0e0e1a2c1d171d2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c"
+            "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2cffc0001108"
+            "0001000103011100021101031101ffc4001500010100000000000000000000"
+            "000000000005ffc40014100100000000000000000000000000000000ffc4001501"
+            "010100000000000000000000000000000005ffc4001411010000000000000000"
+            "00000000000000000000ffda000c03010002110311003f00bf3effd9"
+        )
+
+
+# ---------------------------------------------------------------------------
 # xx 2C overview — 35 packets, byte[4]=0x23, byte[5]=0x00
 # ---------------------------------------------------------------------------
 
@@ -530,8 +603,10 @@ def main():
     ap.add_argument("--protocol-flavor", choices=["rekordbox", "serato"], default="rekordbox",
                     help="Which EP5 screen protocol to drive: "
                          "rekordbox=xx 21 metadata + xx 2C overview + xx 2E PWV5 waveform + xx 3D heartbeat; "
-                         "serato=xx 27 state + xx 36 PWV5 waveform (no overview, no heartbeat). "
+                         "serato=xx 27 state + xx 33 album art + xx 36 PWV5 waveform. "
                          "Match this to --sysex-flavor for the cleanest test.")
+    ap.add_argument("--no-album-art", action="store_true",
+                    help="Skip the xx 33 album-art JPEG upload in Serato flavor.")
     args = ap.parse_args()
     global SYSEX_PING
     if args.sysex_flavor == "serato":
@@ -657,6 +732,15 @@ def main():
             print(f"\nPhase 2: xx 27 state burst (deck {args.deck} loaded) …")
             serato_state_burst(ep_out, loaded_deck=args.deck, cycles=20)
             drain_acks(ep_in, count=10, label="post-state")
+
+            # ===== Phase 2.5: Serato xx 33 album-art upload =====
+            # Hypothesis: firmware won't render waveform / "loaded" text until
+            # an album-art JPEG has been provided.
+            if not args.no_album_art:
+                print(f"\nPhase 2.5: xx 33 album-art (32×32 red JPEG) upload to deck {args.deck} …")
+                art = _generate_test_jpeg()
+                upload_album_art(ep_out, args.deck, art)
+                drain_acks(ep_in, count=10, label="post-album-art")
 
             # ===== Phase 3: Serato xx 36 waveform upload =====
             print(f"\nPhase 3: xx 36 PWV5 waveform upload (Serato framing), {args.duration:.1f}s …")
