@@ -112,54 +112,9 @@ PioneerDDJFLX10._getDeckFromGroup = function(group) {
     return match ? parseInt(match[0], 10) : 1;
 };
 
-// ===== HID screen SysEx handshake ===========================================
-// These two SysEx messages on MIDI OUT are the gate that unlocks the FLX10's
-// HID screen rendering. Without them, our screen.js writes to interface 5
-// are silently rejected by the firmware. Decoded from the Serato capture
-// (2026-05-23). See FLX10-SCREEN-PROTOCOL-FINDINGS.md for the full story.
-PioneerDDJFLX10._SYSEX_ENTER_HID = [
-    0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-    0x00, 0x03, 0x01, 0xF7
-];
-PioneerDDJFLX10._SYSEX_KEEPALIVE = [
-    0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-    0x00, 0x50, 0x31, 0xF7
-];
-// Per-deck init SysEx — Serato sends these after handshake, at track-load
-// time. Hypothesis: one of them puts the firmware into "Serato mode" where
-// time is computed internally (from BPM + position) instead of being driven
-// by the HID xx 27 [9..12] bytes, decoupling wave-scroll from time-display.
-// Decoded 2026-05-24 from flx10-driverrutil-then-serato.pcapng.
-//
-// Pattern: F0 00 40 05 00 00 04 01 <deck-id> 00 00 <state-bytes> F7
-//   deck-id: 0x11 deck1, 0x12 deck2, 0x13 deck3, 0x14 deck4
-//   state-bytes: 02 0e 0e 05 initially; later replaced with track-specific bytes
-PioneerDDJFLX10._SYSEX_DECK_INIT = {
-    1: [0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-        0x00, 0x11, 0x00, 0x00, 0x02, 0x0e, 0x0e, 0x05, 0xF7],
-    2: [0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-        0x00, 0x12, 0x00, 0x00, 0x02, 0x0e, 0x0e, 0x05, 0xF7],
-    3: [0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-        0x00, 0x13, 0x00, 0x00, 0x02, 0x0e, 0x0e, 0x05, 0xF7],
-    4: [0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-        0x00, 0x14, 0x00, 0x00, 0x02, 0x0e, 0x0e, 0x05, 0xF7],
-};
-// Two more globals Serato sends at the same time. Not yet sure what they
-// do — try them together with the per-deck init.
-PioneerDDJFLX10._SYSEX_GLOBAL_B = [
-    0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-    0x00, 0x0b, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF7
-];
-PioneerDDJFLX10._SYSEX_GLOBAL_C = [
-    0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x01,
-    0x00, 0x0c, 0x00, 0x00, 0x02, 0x0e, 0x0e, 0x05, 0x00, 0x01, 0xF7
-];
-PioneerDDJFLX10._sysexKeepaliveTimer = null;
-
 // Initialization
 PioneerDDJFLX10.init = function(id) {
     console.log("Pioneer DDJ-FLX10 PROD - Initialisation");
-
     var initTimeMode = engine.getValue("[Controls]", "ShowDurationRemaining") !== 0 ? 0x7F : 0x00;
     // Plage de pitch par défaut (±16%)
     for (var i = 1; i <= 4; i++) {
@@ -213,131 +168,6 @@ PioneerDDJFLX10.init = function(id) {
         console.log("FLX10 screen: module not loaded — HID interface may be unavailable");
     }
 
-    // HID screen SysEx handshake — sent LAST so that any failure here doesn't
-    // break the MIDI mapping init above. The screen.js HID module relies on
-    // these two SysEx messages: one-shot ENTER_HID then a 200 ms KEEPALIVE.
-    try {
-        midi.sendSysexMsg(PioneerDDJFLX10._SYSEX_ENTER_HID,
-                          PioneerDDJFLX10._SYSEX_ENTER_HID.length);
-        PioneerDDJFLX10._sysexKeepaliveTimer = engine.beginTimer(200, function() {
-            midi.sendSysexMsg(PioneerDDJFLX10._SYSEX_KEEPALIVE,
-                              PioneerDDJFLX10._SYSEX_KEEPALIVE.length);
-        });
-        console.log("FLX10: HID screen SysEx handshake started");
-
-        // EXPERIMENT 2026-05-24: send per-deck init SysEx that Serato sends.
-        // Hypothesis: this puts firmware into "Serato mode" where time is
-        // computed internally → would let us scroll the wave AND have
-        // accurate time. (Without these, the firmware uses HID xx 27 [5..7]
-        // position bytes for both wave scroll AND time computation, which
-        // means we have to pick one.)
-        for (var sd = 1; sd <= 4; sd++) {
-            midi.sendSysexMsg(PioneerDDJFLX10._SYSEX_DECK_INIT[sd],
-                              PioneerDDJFLX10._SYSEX_DECK_INIT[sd].length);
-        }
-        midi.sendSysexMsg(PioneerDDJFLX10._SYSEX_GLOBAL_B,
-                          PioneerDDJFLX10._SYSEX_GLOBAL_B.length);
-        midi.sendSysexMsg(PioneerDDJFLX10._SYSEX_GLOBAL_C,
-                          PioneerDDJFLX10._SYSEX_GLOBAL_C.length);
-        console.log("FLX10: Serato-mode per-deck SysEx sent (experimental)");
-    } catch (e) {
-        console.log("FLX10: SysEx handshake failed (screen waveform won't render): " + e);
-    }
-
-    // ===== FLX10 screen daemon IPC =====
-    // Two log line types the daemon (flx10_screen_daemon.py) tails:
-    //   FLX10_TRACK_LOAD deck=N samples=X file_bpm=Y duration=Z
-    //   FLX10_POS        deck=N pos=0.0234
-    //
-    // Track-load matching uses track_samples + file_bpm (both invariant to
-    // pitch-fader adjustments) because Mixxx's controller API does NOT
-    // expose track_id to scripts. The samples count alone is functionally
-    // unique per track; file_bpm is a collision safeguard.
-    //
-    // FLX10_POS lines stream the play position (0..1) of every PLAYING deck
-    // every 100ms — the daemon will use this to drive the firmware's
-    // scrolling playhead once we figure out the byte encoding.
-
-    PioneerDDJFLX10._lastLoggedDuration = {1: 0, 2: 0, 3: 0, 4: 0};
-    PioneerDDJFLX10._lastLoggedPos      = {1: -1, 2: -1, 3: -1, 4: -1};
-
-    PioneerDDJFLX10._logTrackLoadDeferred = function(deck) {
-        var group   = "[Channel" + deck + "]";
-        var dur     = engine.getValue(group, "duration");
-        var samples = engine.getValue(group, "track_samples");
-        var fbpm    = engine.getValue(group, "file_bpm");
-        if (dur > 0 && samples > 0) {
-            console.log("FLX10_TRACK_LOAD deck=" + deck
-                        + " samples=" + samples.toFixed(0)
-                        + " file_bpm=" + fbpm.toFixed(2)
-                        + " duration=" + dur.toFixed(2));
-            // Force an immediate FLX10_BPM log so the daemon's pitch-adjusted
-            // BPM display refreshes on track load (otherwise the polling loop
-            // only logs when liveBpm CHANGES — if the new track's liveBpm
-            // happens to equal _lastLoggedBpm, the display stays stuck on the
-            // previous track's value until the user moves the pitch slider).
-            var rateRatio = engine.getValue(group, "rate_ratio");
-            var liveBpm   = fbpm * rateRatio;
-            var rounded   = Math.round(liveBpm * 10) / 10;
-            PioneerDDJFLX10._lastLoggedBpm[deck] = rounded;
-            console.log("FLX10_BPM deck=" + deck + " bpm=" + rounded.toFixed(2));
-        }
-    };
-
-    for (var d = 1; d <= 4; d++) {
-        (function(deck) {
-            engine.makeConnection(
-                "[Channel" + deck + "]",
-                "duration",
-                function(value) {
-                    if (value > 0 && value !== PioneerDDJFLX10._lastLoggedDuration[deck]) {
-                        PioneerDDJFLX10._lastLoggedDuration[deck] = value;
-                        // 300 ms defer so Mixxx populates track_samples + file_bpm
-                        engine.beginTimer(300, function() {
-                            PioneerDDJFLX10._logTrackLoadDeferred(deck);
-                        }, true);
-                    }
-                }
-            );
-        })(d);
-    }
-
-    // Playhead position poller — every 100 ms, for any LOADED deck, log the
-    // fractional position if it changed. (Tried 25ms for smoother display;
-    // caused timer drift between FLX10 and Mixxx UI, possibly due to Mixxx
-    // UI lag under heavy script polling. Reverted to 100ms.)
-    PioneerDDJFLX10._lastLoggedBpm = {1: 0, 2: 0, 3: 0, 4: 0};
-    engine.beginTimer(100, function() {
-        for (var dd = 1; dd <= 4; dd++) {
-            var grp = "[Channel" + dd + "]";
-            var dur = engine.getValue(grp, "duration");
-            if (dur <= 0) {
-                continue;     // nothing loaded
-            }
-            // Position
-            var pos = engine.getValue(grp, "playposition");
-            var posRounded = Math.round(pos * 10000) / 10000;
-            if (posRounded !== PioneerDDJFLX10._lastLoggedPos[dd]) {
-                PioneerDDJFLX10._lastLoggedPos[dd] = posRounded;
-                console.log("FLX10_POS deck=" + dd + " pos=" + posRounded.toFixed(4));
-            }
-            // Active BPM = stable file_bpm × Mixxx's rate_ratio.
-            // We can't use Mixxx's `bpm` CO directly — it's the live
-            // beat-tracker estimate and fluctuates wildly between beats.
-            // rate_ratio is the actual playback multiplier (1.0 = no change,
-            // 1.16 = 16% faster) and already accounts for rate_dir, so it's
-            // direction-correct regardless of the slider-inversion setting.
-            var fileBpm   = engine.getValue(grp, "file_bpm");
-            var rateRatio = engine.getValue(grp, "rate_ratio");
-            var liveBpm   = fileBpm * rateRatio;
-            var bpmRounded = Math.round(liveBpm * 10) / 10;
-            if (bpmRounded !== PioneerDDJFLX10._lastLoggedBpm[dd]) {
-                PioneerDDJFLX10._lastLoggedBpm[dd] = bpmRounded;
-                console.log("FLX10_BPM deck=" + dd + " bpm=" + bpmRounded.toFixed(2));
-            }
-        }
-    });
-
     return true;
 };
 
@@ -369,17 +199,10 @@ PioneerDDJFLX10._updateRate = function(deck) {
 // Shutdown
 PioneerDDJFLX10.shutdown = function() {
     console.log("Pioneer DDJ-FLX10 PROD - Arrêt");
-
-    // Stop the SysEx keepalive timer (paired with init).
-    if (PioneerDDJFLX10._sysexKeepaliveTimer !== null) {
-        engine.stopTimer(PioneerDDJFLX10._sysexKeepaliveTimer);
-        PioneerDDJFLX10._sysexKeepaliveTimer = null;
-    }
-
     if (typeof PioneerDDJFLX10.screen !== "undefined") {
         PioneerDDJFLX10.screen.stop();
     }
-
+    
     // Turn off all LEDs
     for (var i = 1; i <= 4; i++) {
         var group = "[Channel" + i + "]";
@@ -501,14 +324,13 @@ PioneerDDJFLX10.jogMarker = function(value, group, control) {
     PioneerDDJFLX10._jogSend14(_JOG_MARKER_MSB[i], _JOG_MARKER_LSB[i], deg);
 };
 
-// BPM display: bpm * 10 as a 14-bit integer.
-// DISABLED — HID xx 27 BPM (from screen.js) is the authoritative source.
-// Earlier test 2026-05-24: putting NO BPM in HID and relying on MIDI
-// resulted in the FLX10 BPM display going blank — HID-blank-byte
-// overrides MIDI. So screen.js owns BPM via HID, and this MIDI path
-// stays a no-op.
+// BPM display: bpm * 10 as a 14-bit integer
 PioneerDDJFLX10.jogBpm = function(value, group, control) {
-    return;
+    var i = PioneerDDJFLX10._getDeckFromGroup(group) - 1;
+    var bpm10 = Math.round(value * 10);
+    if (bpm10 < 0) { bpm10 = 0; }
+    if (bpm10 > 16383) { bpm10 = 16383; }
+    PioneerDDJFLX10._jogSend14(_JOG_BPM_MSB[i], _JOG_BPM_LSB[i], bpm10);
 };
 
 // Speed display: rate (-1..+1) → centered at 0% → (rate*100+100)*10, 14-bit

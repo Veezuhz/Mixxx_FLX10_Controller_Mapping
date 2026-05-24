@@ -1,6 +1,55 @@
 # DDJ-FLX10 Jog Wheel Screen Protocol — Findings & Open Problem
 
-**Status (2026-05-23 evening):** **BREAKTHROUGH** — jog wheel LCDs render for the first time when we send `03 01` SysEx one-shot + `50 31` Serato-flavor keepalive on MIDI OUT, then drive screen data on EP5 HID. The lights come on and the deck-info text appears ("no track loaded" placeholder shown — meaning the firmware is rendering, just not satisfied with our `xx 21` metadata content). All earlier negative results were because we were polling rekordbox's `50 00` keepalive flavor instead of `50 31`.
+**Status (2026-05-24 — SCROLLING WAVEFORMS, IN-SYNC):** Loading any analyzed track in Mixxx automatically renders its colored waveform on the FLX10 jog wheel; the waveform **scrolls in sync with playback and responds to scrubbing on paused decks**. Pipeline:
+
+1. Mixxx's MIDI script (`Pioneer-DDJ-FLX10-scripts.js`) logs `FLX10_TRACK_LOAD deck=N samples=X file_bpm=Y duration=Z` on track load and `FLX10_POS deck=N pos=0.0234` every 100ms for any loaded deck.
+2. Daemon `flx10_screen_daemon.py` tails `~/.mixxx/mixxx.log`, parses both log types.
+3. On track load: looks up the track in `mixxxdb.sqlite` by matching `track_samples` (pitch-invariant) + `file_bpm` against `samplerate × duration × channels`. Reads `~/.mixxx/analysis/<analysis_id>` directly, parses the zlib+protobuf in-memory, downsamples Mixxx's 441 fps → Pioneer's 150 fps, encodes PWV5 with low→red/mid→green/high→blue, uploads via the full Serato `xx 30/39/33/35/36/2f` sequence.
+4. **200 Hz state-ping** continuously writes the playhead position into `xx 27 [5,6,7]` BE24 = `pos × duration_sec × 128`. POS_RATE=128/sec was determined empirically — the FLX10 firmware interprets each unit as 1/128 sec of audio.
+5. **20 Hz `xx 36` trickle** per loaded deck writes 19 entries at the current playhead — keeps the firmware's display buffer alive (without this it drops the waveform after ~1 minute).
+
+No pre-rendering needed; Mixxx's existing analysis data is the source of truth.
+
+**Working invocation for real waveforms:**
+
+```bash
+# One-time per track: pre-render Mixxx's analysis to PWV5 cache
+python3 ~/.mixxx/controllers/"DDJ-FLX10 Screen Protocol"/flx10_prerender_waveform.py <track_id>
+# Then play it on the FLX10 (Mixxx HID screen controller must be disabled or Mixxx closed)
+sudo python3 ~/.mixxx/controllers/"DDJ-FLX10 Screen Protocol"/flx10_rekordbox_proto.py \
+    --deck 2 --sysex-flavor serato --protocol-flavor serato \
+    --wave-file 2:/home/vpinedax/.flx10-cache/<track_id>.pwv5
+```
+
+**Earlier milestone (Mixxx integrated):** Updated `PioneerDDJFLX10-screen.js` (Serato protocol, solid-red placeholder waveform) + `Pioneer-DDJ-FLX10-scripts.js` (SysEx handshake) deliver end-to-end working waveform display on the FLX10 when running Mixxx 2.5.6 on Linux — but with a placeholder waveform because Mixxx HID scripts cannot read filesystem cache files. Real-waveform display requires running the pyusb test script as a separate process (the daemon path described below).
+
+**Known limitation (open work item):** the deck-info text fields (time, BPM) on the jog LCDs show fixed placeholder values from `xx 27` instead of Mixxx's real ch16 MIDI values. Removing the duration/BPM bytes from `xx 27` ([16,17] and [21,22]) didn't shift control back to MIDI ch16 — the firmware enters "HID controls text" mode whenever `xx 27` has any track_loaded markers set, and dropping the loaded markers entirely also drops the waveform render. To fix this we need to reverse-engineer the encoding of the duration/BPM/track-id bytes so we can populate them with real Mixxx track data instead of placeholders. A second Serato capture with different known-duration tracks would let us crack the encoding by correlation.
+
+---
+
+**Original status (2026-05-23 night, pre-Mixxx-integration):** SYNTHESIZED WAVEFORMS RENDER on the FLX10 jog wheel via Linux.
+
+**Confirmed working invocation:**
+
+```bash
+sudo python3 "DDJ-FLX10 Screen Protocol/flx10_rekordbox_proto.py" --deck 2 \
+    --sysex-flavor serato --protocol-flavor serato --solid-waveform
+```
+
+**The five byte-level bugs that were hiding from us:**
+
+1. `xx 27` loaded packet: bytes `[32,33]` must be `ff ff`, not `e0 01` (we'd flipped these based on a misleading histogram).
+2. `xx 30` init packet: 8 enable-flags at positions `[10, 16, 22, 28, 34, 40, 46, 52]` all must be `0xff`. We were setting only `[10]`.
+3. `xx 35`: 3 packets per deck (first all-zero header; next two with `[2]=0e [3]=e3`) — sent right BEFORE `xx 36`. Missing entirely from our script.
+4. `xx 39` pad labels: had several `02 3f` markers at irregular positions across the 3 segments. Hardcoded byte-for-byte from capture now.
+5. `xx 2f` cue-data placeholder: missing entirely. One packet per deck after `xx 36`.
+
+Required SEND ORDER per deck: `xx 27 → xx 30 → xx 39 → xx 33 → xx 35 → xx 36 → xx 2f`. Must repeat for all 4 decks (Serato's dual-deck UI requires deck-1 waveform data to render the deck-2 view too).
+
+**Remaining work is integration, not protocol decoding:**
+
+- Port to Mixxx (`PioneerDDJFLX10-screen.js` + SysEx handshake in `PioneerDDJFLX10-scripts.js` since HID controllers cannot send MIDI in Mixxx)
+- Hook real Mixxx track waveform data into the `xx 36` upload (currently uses a synthetic test pattern)
 
 ```bash
 # Confirmed working invocation:

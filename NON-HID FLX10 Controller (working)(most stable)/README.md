@@ -5,7 +5,7 @@ Mixxx controller mapping for the Pioneer DDJ-FLX10 (v1.0.1).
 
 ## Files explanation
 
-There are 3 files that need to go into you Mixxx controller folder when using the NON-HID version (most stable at the moment).
+There are 3 files that need to go into you Mixxx controller folder.
    * `Pioneer-DDJ-FLX10-scripts.js`
    * `Pioneer-DDJ-FLX10-midi.xml`
    * `common-controllelr-scripts.js`

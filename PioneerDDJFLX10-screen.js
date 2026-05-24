@@ -1,276 +1,437 @@
-// PioneerDDJFLX10-screen.js  v0.5
-// Standalone HID jog display module for DDJ-FLX10.
-// Loaded by PioneerDDJFLX10-screen.hid.xml as a separate HID controller mapping.
+// PioneerDDJFLX10-screen.js  v1.0 (Serato protocol, byte-perfect)
+// HID jog wheel screen module for the DDJ-FLX10.  Loaded by
+// PioneerDDJFLX10-screen.hid.xml as a separate HID controller mapping.
 //
-// In this HID context, controller.send(pkt, null, 0) routes to interface 5 (screen).
+// This v1.0 module is the result of multi-day reverse engineering that
+// culminated 2026-05-23.  Every packet here is byte-for-byte verified against
+// captures from Serato DJ Pro driving the same FLX10 hardware.  When the
+// MIDI mapping (Pioneer-DDJ-FLX10-scripts.js) does the SysEx handshake and
+// the user has run the vendor unlock (flx10_unlock_v2.py), this module
+// renders a real waveform across the FLX10's jog wheel discs.
 //
-// v0.4 changes (based on VirtualDJ capture analysis):
-//   - Switched waveform command from xx 2E (PWV5 color detail) to xx 38 (3-band).
-//   - Each entry is 3 bytes (low, mid, high), DUPLICATED on the wire (6 bytes per
-//     logical entry). Verified 100% match against VirtualDJ across 5,184 entries.
-//   - Stream begins with 4-byte header (entry count LE16 + 0x00 0x00).
-//   - Each segment body starts with a 0x01 marker, then 122 bytes of stream data.
-//   - Heartbeats DISABLED by default — VirtualDJ sent zero xx 3D packets across
-//     26 seconds of visible waveform rendering. Set _ENABLE_HEARTBEAT = true if
-//     testing suggests otherwise.
-//   - Test pattern produces visible bass-kick rhythm so you can verify rendering.
+// CRITICAL PRECONDITIONS (without these the firmware silently drops everything):
 //
-// Known issue: when we replayed VirtualDJ's exact bytes via raw /dev/hidraw on
-// Linux, the device acknowledged everything but did not render. Going through
-// Mixxx's HID API (different USB stack path, possibly libusb-based hidapi) is
-// the remaining variable worth testing.
+//   1. Vendor unlock done.  Run:
+//        sudo python3 ~/.mixxx/controllers/flx10_unlock_v2.py
+//      once after plugging in the FLX10.  Mixxx cannot do this itself —
+//      it requires snd-usb-audio unbind/rebind on Linux.
+//
+//   2. SysEx handshake running on MIDI OUT:
+//        - F0 00 40 05 00 00 04 01 00 03 01 F7   sent once at startup
+//        - F0 00 40 05 00 00 04 01 00 50 31 F7   keepalive every ~200 ms
+//      These are sent from the MIDI mapping (PioneerDDJFLX10.init / .shutdown
+//      in Pioneer-DDJ-FLX10-scripts.js) because Mixxx HID controller scripts
+//      cannot send MIDI.
+//
+// SEND ORDER for waveform render (per deck, on track load):
+//   xx 27 state → xx 30 init → xx 39 labels → xx 33 album art → xx 35 begin →
+//   xx 36 waveform → xx 2f cue placeholder
+// Plus xx 27 sustained at 50 Hz across all 4 decks while running.
 
 var PioneerDDJFLX10Screen = {};
 
-PioneerDDJFLX10Screen._ENABLE_HEARTBEAT = false;   // xx 3D — not used by VirtualDJ
-PioneerDDJFLX10Screen._HEARTBEAT_MS     = 20;
-PioneerDDJFLX10Screen._HEARTBEAT_SEGS   = 5;
-PioneerDDJFLX10Screen._METADATA_MS      = 20;      // xx 21 — 50 Hz per-deck, required
-PioneerDDJFLX10Screen._ENTRIES_PER_SEC  = 150;
-PioneerDDJFLX10Screen._SEG_PAYLOAD      = 122;     // 128 - 5 hdr - 1 marker
-PioneerDDJFLX10Screen._SEGS_PER_SUB     = 255;
-PioneerDDJFLX10Screen._OVERVIEW_ENTRIES = 600;     // fixed-size overview ring
-PioneerDDJFLX10Screen._heartbeatTimer   = null;
-PioneerDDJFLX10Screen._metadataTimer    = null;
-PioneerDDJFLX10Screen._lastDuration     = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._DECK_BYTE     = [0x10, 0x20, 0x30, 0x40];
+PioneerDDJFLX10Screen._STATE_BYTE_31 = {0x10: 0x02, 0x20: 0x01, 0x30: 0x04, 0x40: 0x03};
+PioneerDDJFLX10Screen._STATE_MS      = 100;    // 10 Hz xx 27 timer — using
+                                               // engine.beginTimer (unconditional)
+                                               // because Mixxx THROTTLES makeConnection
+                                               // callbacks on playposition (per the
+                                               // comment in scripts.js line ~159).
+                                               // Event-driven approach was unreliable
+                                               // because the underlying CO callback
+                                               // fired less often than expected.
+PioneerDDJFLX10Screen._WAVE_DURATION = 30;     // seconds of test-pattern waveform
+PioneerDDJFLX10Screen._lastDuration  = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._stateTimer    = null;
 
-PioneerDDJFLX10Screen._DECK_BYTE = [0x10, 0x20, 0x30, 0x40];
 
-
-// ----- Raw HID send via Mixxx -----------------------------------------------
+// ===== Raw HID send via Mixxx ===============================================
 PioneerDDJFLX10Screen._send = function(pkt) {
     controller.send(pkt, null, 0);
 };
 
-PioneerDDJFLX10Screen._buildPkt = function(b0, b1, seg, sub, b4) {
+PioneerDDJFLX10Screen._zeros = function() {
     var p = [];
     for (var i = 0; i < 128; i++) { p[i] = 0; }
-    p[0] = b0 & 0xFF; p[1] = b1 & 0xFF;
-    p[2] = seg & 0xFF; p[3] = sub & 0xFF; p[4] = b4 & 0xFF;
     return p;
 };
 
 
-// ----- xx 21 — Track Metadata (50 Hz, all decks, required) -----------------
-//
-// Format decoded from VirtualDJ capture. Sending all zeros told the firmware
-// "no track loaded" and suppressed rendering. Key bytes:
-//   [3]=0x0a [4]=0x04 [5]=0x01 [7]=0x02(loaded)/0x01(empty) [10]=0x0e
-//   [21-24]=0x75,0x40,0x2a,0xff(loaded) or 0x78,0,0,0(empty)
-//   [27]=0x80 [49]=0x30 [58]=0x03 [59]=overview_segs [61]=0x0d
-//
-PioneerDDJFLX10Screen._buildMetadataPkt = function(deckByte, trackLoaded, playing) {
-    var pkt = [];
-    var i;
-    for (i = 0; i < 128; i++) { pkt[i] = 0; }
-    pkt[0]  = deckByte;
-    pkt[1]  = 0x21;
-    pkt[3]  = 0x0a;
-    // byte[4] and byte[5] reflect playback state:
-    //   stopped: 0x04, 0x01   playing: 0x0c, 0x81  (from VirtualDJ capture)
-    pkt[4]  = playing ? 0x0c : 0x04;
-    pkt[5]  = playing ? 0x81 : 0x01;
-    pkt[7]  = trackLoaded ? 0x02 : 0x01;
-    pkt[10] = 0x0e;
+// Per-deck cache of Mixxx-derived data we want to bake into the next xx 27 ping.
+PioneerDDJFLX10Screen._deckBpm = {1: 0, 2: 0, 3: 0, 4: 0};
+
+PioneerDDJFLX10Screen._deckFromDeckByte = function(deckByte) {
+    if (deckByte === 0x10) { return 1; }
+    if (deckByte === 0x20) { return 2; }
+    if (deckByte === 0x30) { return 3; }
+    if (deckByte === 0x40) { return 4; }
+    return 0;
+};
+
+// ===== xx 27 — per-deck state ping (sent at 50 Hz to all 4 decks) ===========
+// Reads pos / duration / BPM directly from Mixxx COs each tick — no log-tail
+// lag (which was the source of the 5-20s timer drift in the daemon-only
+// architecture). Verified protocol byte layout (cracked 2026-05-23):
+//   [5..7]  BE24 = elapsed × 128 (playhead marker position)
+//   [9..12] = remaining MM:SS:ms (firmware also uses these as the "loaded"
+//             gate — if all zero, wave display drops)
+//   [13]    = BPM integer
+//   [14]    high nibble = BPM decimal tenths (low nibble unused)
+PioneerDDJFLX10Screen._POS_RATE = 128.0;
+
+PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
+    var p = this._zeros();
+    p[0]  = deckByte;
+    p[1]  = 0x27;
+    p[2]  = 0xb4;
+    p[3]  = 0x80;
+    p[4]  = 0x01;
+    p[20] = 0x0e;
+    p[25] = 0x80;
+    p[30] = 0x0d;
+    p[31] = this._STATE_BYTE_31[deckByte];
+    // Trailer e0 01 00 verified from steady-playback Serato capture
+    // (NOT ff ff ff which was from paused-state captures).
+    p[32] = 0xe0;
+    p[33] = 0x01;
+    p[34] = 0x00;
     if (trackLoaded) {
-        pkt[21] = 0x75; pkt[22] = 0x40; pkt[23] = 0x2a; pkt[24] = 0xff;
-        pkt[49] = playing ? 0x20 : 0x30;
+        var deckNum = this._deckFromDeckByte(deckByte);
+        var group   = "[Channel" + deckNum + "]";
+        var pos      = engine.getValue(group, "playposition");
+        var duration = engine.getValue(group, "duration");
+        var fileBpm  = engine.getValue(group, "file_bpm");
+        var rateRatio = engine.getValue(group, "rate_ratio");
+        var liveBpm  = fileBpm * rateRatio;
+
+        // Static loaded markers (verified from Serato capture)
+        p[29] = 0x92;
+
+        // Remaining time: [9]=min, [10]=sec, [11,12] LE16=ms.
+        // No compensation — testing whether the unconditional timer (vs
+        // throttled CO callback) is the root cause of the drift we saw.
+        if (duration > 0) {
+            var pClamped = pos;
+            if (pClamped < 0.0) pClamped = 0.0;
+            if (pClamped > 1.0) pClamped = 1.0;
+            var remainingSec = duration * (1.0 - pClamped);
+            var totalMs = Math.round(remainingSec * 1000);
+            if (totalMs < 0) totalMs = 0;
+            var minutes = Math.floor(totalMs / 60000);
+            var remMs   = totalMs % 60000;
+            var seconds = Math.floor(remMs / 1000);
+            var ms      = remMs % 1000;
+            p[9]  = minutes & 0xFF;
+            p[10] = seconds & 0xFF;
+            p[11] = ms & 0xFF;
+            p[12] = (ms >> 8) & 0xFF;
+        } else {
+            p[9]  = 0x06;  p[10] = 0x1b;  p[11] = 0xfa;  p[12] = 0x01;
+        }
+
+        // BPM integer + decimal tenths nibble (same reason as time —
+        // sending zero bytes makes the FLX10 BPM field blank).
+        if (liveBpm > 0) {
+            p[13] = Math.floor(liveBpm) & 0xFF;
+            var frac = liveBpm - Math.floor(liveBpm);
+            p[14] = (Math.round(frac * 10) & 0x0F) << 4;
+        }
+
+        // Playhead position BE24 = pos × duration × 128 (drives wave scroll).
+        // Previously we sent ZEROS here to force firmware to use [9..12]
+        // time bytes (because position bytes also drive time interpretation,
+        // causing drift). Now testing whether Serato-mode SysEx (sent by
+        // scripts.js init, 2026-05-24) decouples them so both work.
+        if (duration > 0) {
+            var posValue = Math.floor(pos * duration * this._POS_RATE);
+            if (posValue < 0) posValue = 0;
+            if (posValue > 0xFFFFFF) posValue = 0xFFFFFF;
+            p[5] = (posValue >> 16) & 0xFF;
+            p[6] = (posValue >> 8) & 0xFF;
+            p[7] = posValue & 0xFF;
+        }
     } else {
-        pkt[21] = 0x78;
+        p[29] = 0x80;
     }
-    pkt[27] = 0x80;
-    pkt[58] = 0x03;
-    pkt[59] = 0x1e;   // 30 overview segments
-    pkt[61] = 0x0d;
-    return pkt;
+    return p;
 };
 
-PioneerDDJFLX10Screen._sendMetadata = function(deck, trackLoaded, playing) {
-    var deckByte = PioneerDDJFLX10Screen._DECK_BYTE[deck - 1];
-    if (deckByte === undefined) { return; }
-    PioneerDDJFLX10Screen._send(
-        PioneerDDJFLX10Screen._buildMetadataPkt(deckByte, !!trackLoaded, !!playing)
-    );
-};
+// EXPERIMENT FLAG: when true, ALWAYS send xx 27 as track_loaded=false even
+// when Mixxx has a track loaded. Tests whether the firmware will keep
+// rendering an already-uploaded xx 36 waveform even with xx 27 in empty
+// state. If yes, this unlocks MIDI channel-16 to drive the deck-info text
+// (BPM, time) like it does without our HID module.
+// Set to false to use the proven "loaded markers => waveform renders" path
+// (which also overrides MIDI ch16 text with hardcoded placeholders).
+// Decision (2026-05-23): the firmware requires xx 27 to carry track-loaded
+// markers in order to keep the xx 36 waveform visible. As soon as we send
+// track_loaded=false, the firmware drops the waveform too (verified by
+// flipping this flag to true and observing no render). So we keep it false
+// here. The cost is that the firmware uses its own text fields (driven by
+// our hardcoded state-5 bytes in _buildState) instead of MIDI ch16 — the
+// time and BPM displays show placeholder values until we figure out the
+// real encoding for the duration/BPM bytes. See FLX10-SCREEN-PROTOCOL-FINDINGS.md.
+PioneerDDJFLX10Screen._FORCE_STATE_EMPTY_FOR_MIDI_TEXT = false;
 
-PioneerDDJFLX10Screen._metadataTick = function() {
+PioneerDDJFLX10Screen._sendStateAllDecks = function() {
     for (var d = 1; d <= 4; d++) {
-        var loaded  = PioneerDDJFLX10Screen._lastDuration[d] > 0;
-        var playing = loaded && engine.getValue("[Channel" + d + "]", "play") > 0;
-        PioneerDDJFLX10Screen._sendMetadata(d, loaded, playing);
+        var duration = engine.getValue("[Channel" + d + "]", "duration");
+        // CRITICAL: skip xx 27 for unloaded decks. Sending "empty deck"
+        // xx 27 packets RESETS the firmware's global display state and
+        // also wastes USB bandwidth/JS time. Daemon's old StatePingThread
+        // had the same skip logic; we kept missing it in screen.js until
+        // the perceived lag forced a closer look.
+        this._lastDuration[d] = duration;
+        if (!(duration > 0)) { continue; }
+        if (this._FORCE_STATE_EMPTY_FOR_MIDI_TEXT) { continue; }
+        this._send(this._buildState(this._DECK_BYTE[d - 1], true));
+    }
+};
+
+// Event-driven scheduler: called whenever playposition / rate_ratio changes.
+// Throttles to _SEND_MIN_GAP_MS to avoid flooding Mixxx's HID write queue.
+PioneerDDJFLX10Screen._lastSendTime = 0;
+PioneerDDJFLX10Screen._scheduleStateUpdate = function() {
+    var now = Date.now();
+    if (now - this._lastSendTime >= this._SEND_MIN_GAP_MS) {
+        this._lastSendTime = now;
+        this._sendStateAllDecks();
     }
 };
 
 
-// ----- Heartbeat (currently disabled) ---------------------------------------
-PioneerDDJFLX10Screen._heartbeat = function() {
-    for (var s = 1; s <= PioneerDDJFLX10Screen._HEARTBEAT_SEGS; s++) {
-        PioneerDDJFLX10Screen._send(
-            PioneerDDJFLX10Screen._buildPkt(0x00, 0x3D, s, 0x00,
-                                            PioneerDDJFLX10Screen._HEARTBEAT_SEGS)
-        );
+// ===== xx 30 — per-deck init (8 enable-flags at [10,16,22,28,34,40,46,52]) =
+PioneerDDJFLX10Screen._sendInit30 = function(deck) {
+    var p = this._zeros();
+    p[0] = this._DECK_BYTE[deck - 1];
+    p[1] = 0x30;
+    p[2] = 0x01;
+    p[4] = 0x01;
+    var flags = [10, 16, 22, 28, 34, 40, 46, 52];
+    for (var i = 0; i < flags.length; i++) { p[flags[i]] = 0xff; }
+    this._send(p);
+};
+
+
+// ===== xx 35 — "begin waveform" (3 packets per deck) =======================
+PioneerDDJFLX10Screen._sendInit35 = function(deck) {
+    var db = this._DECK_BYTE[deck - 1];
+    var p1 = this._zeros();
+    p1[0] = db;  p1[1] = 0x35;
+    this._send(p1);
+    for (var i = 0; i < 2; i++) {
+        var p = this._zeros();
+        p[0] = db;  p[1] = 0x35;  p[2] = 0x0e;  p[3] = 0xe3;
+        this._send(p);
     }
 };
 
 
-// ----- 3-band waveform entries (test pattern with kick drums) ---------------
-// Produces visually recognizable output: rhythmic bass kicks with an envelope.
-// Replace this with real Mixxx waveform data once we have something rendering.
-PioneerDDJFLX10Screen._generateWaveformEntries = function(durationSec) {
-    var n = Math.floor(durationSec * PioneerDDJFLX10Screen._ENTRIES_PER_SEC);
-    var entries = [];
-    for (var i = 0; i < n; i++) {
-        var t = i / PioneerDDJFLX10Screen._ENTRIES_PER_SEC;
-        var env = 0.3 + 0.7 * Math.abs(((Math.floor(i / 75) % 4) - 1.5) / 1.5);
-        var low  = Math.round(((t % 1.0) < 0.05 ? 255 : 30) * env);
-        var mid  = Math.round(((t % 0.5) < 0.04 ? 200 : 40) * env);
-        var high = Math.round(((t % 2.0) < 0.15 ? 180 : 50) * env);
-        entries.push([low, mid, high]);
-    }
-    return entries;
-};
+// ===== xx 39 — pad-mode labels ("HOT CUE"), 3 packets per deck =============
+// Hardcoded byte-for-byte from Serato capture; only byte[0] (deck) varies.
+PioneerDDJFLX10Screen._XX39_HEX = [
+    "10390100030000484f54204355450000000000000000000000000000000000000000000000003f000000000000000000000000000000000000000000000000000000000000023f000000000000000000000000000000000000000000000000000000000000023f00000000000000000000000000000000000000000000000000",
+    "1039020003000000000000023f000000000000000000000000000000000000000000000000000000000000023f000000000000000000000000000000000000000000000000000000000000023f000000000000000000000000000000000000000000000000000000000000023f00000000000000000000000000000000000000",
+    "1039030003000000000000000000000000023f00000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+];
 
-
-// ----- xx 37 — Waveform Overview upload ------------------------------------
-//
-// Format verified from VirtualDJ pcapng capture:
-//   byte[5] = 0x00 — NO marker byte (unlike xx 38 which uses 0x01)
-//   payload = 122 raw 3-byte entries at bytes[6..127] — NO 4-byte count header
-//   NO entry duplication (each [lo,md,hi] sent once, unlike xx 38)
-//   30 segments × 122 bytes = 3660 bytes = 1220 entries per upload
-//
-PioneerDDJFLX10Screen._uploadOverview = function(deck) {
-    var deckByte = PioneerDDJFLX10Screen._DECK_BYTE[deck - 1];
-    if (deckByte === undefined) { return; }
-    var PAYLOAD = PioneerDDJFLX10Screen._SEG_PAYLOAD;
-    var n = 30 * PAYLOAD / 3;   // 1220 entries
-    var i, phase, lo, md, hi;
-    var stream = [];
-    for (i = 0; i < n; i++) {
-        phase = i / n;
-        lo = Math.round(180 * (0.5 + 0.5 * Math.sin(phase * 6.28 * 8)));
-        md = Math.round(100 * (0.5 + 0.5 * Math.sin(phase * 6.28 * 12 + 1)));
-        hi = Math.round(60  * (0.5 + 0.5 * Math.sin(phase * 6.28 * 16 + 2)));
-        stream.push(lo, md, hi);   // no duplication
-    }
-    var pos = 0;
-    var seg = 1;
-    var j;
-    while (pos < stream.length) {
-        var pkt = PioneerDDJFLX10Screen._buildPkt(deckByte, 0x37, seg, 0x00, 0x1E);
-        // byte[5] stays 0x00 — no marker for xx 37
-        for (j = 0; j < PAYLOAD; j++) {
-            pkt[6 + j] = (pos + j < stream.length) ? stream[pos + j] : 0;
+PioneerDDJFLX10Screen._sendInit39 = function(deck) {
+    var db = this._DECK_BYTE[deck - 1];
+    for (var s = 0; s < 3; s++) {
+        var hex = this._XX39_HEX[s];
+        var p = [];
+        for (var i = 0; i < 128; i++) {
+            p[i] = parseInt(hex.substr(i * 2, 2), 16);
         }
-        PioneerDDJFLX10Screen._send(pkt);
-        pos += PAYLOAD;
-        seg++;
+        p[0] = db;
+        this._send(p);
     }
 };
 
 
-// ----- Waveform upload (xx 38, 3-band format) -------------------------------
-//
-// Packet layout (128 bytes each):
-//   [0]      deck byte (0x10/0x20/0x30/0x40)
-//   [1]      0x38                     (waveform command)
-//   [2]      segment number (1..255)
-//   [3]      subframe (0 or 1)
-//   [4]      0xD9                     (declared total)
-//   [5]      0x01                     (segment data marker — required)
-//   [6..127] up to 122 bytes of stream data
-//
-// Continuous stream (concatenation of all segments' bytes [6..end]):
-//   [0..3]   4-byte header (entry count LE16 + two zeros)
-//   [4+]     3-byte entries, EACH DUPLICATED on the wire:
-//              low, mid, high, low, mid, high, low, mid, high, ...
-//
-PioneerDDJFLX10Screen._uploadWaveform = function(deck, entries) {
-    var deckByte = PioneerDDJFLX10Screen._DECK_BYTE[deck - 1];
-    if (deckByte === undefined) { return; }
-    var nEntries = entries.length;
-    var i, j, lo, md, hi;
+// ===== xx 2f — cue-data placeholder (one empty packet per deck) ============
+PioneerDDJFLX10Screen._sendInit2f = function(deck) {
+    var p = this._zeros();
+    p[0] = this._DECK_BYTE[deck - 1];
+    p[1] = 0x2f;
+    p[2] = 0x01;
+    p[4] = 0x01;
+    this._send(p);
+};
 
-    // Build the continuous stream
-    var stream = [
-        nEntries & 0xFF,
-        (nEntries >> 8) & 0xFF,
-        0x00,
-        0x00
-    ];
-    for (i = 0; i < nEntries; i++) {
-        lo = entries[i][0] & 0xFF;
-        md = entries[i][1] & 0xFF;
-        hi = entries[i][2] & 0xFF;
-        stream.push(lo); stream.push(md); stream.push(hi);
-        stream.push(lo); stream.push(md); stream.push(hi);
+
+// ===== xx 33 — album-art JPEG upload =======================================
+// Hardcoded 240×240 red JPEG (1529 bytes).  In a future iteration this would
+// be replaced with real cover-art bytes per track.
+PioneerDDJFLX10Screen._TEST_JPEG_HEX = (
+    "ffd8ffe000104a46494600010100000100010000ffdb0043000a07070807060a" +
+    "0808080b0a0a0b0e18100e0d0d0e1d15161118231f2524221f2221262b372f26" +
+    "293429212230413134393b3e3e3e252e4449433c48373d3e3bffdb0043010a0b" +
+    "0b0e0d0e1c10101c3b2822283b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b" +
+    "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3bffc0" +
+    "00110800f000f003012200021101031101ffc4001f0000010501010101010100" +
+    "000000000000000102030405060708090a0bffc400b510000201030302040305" +
+    "0504040000017d01020300041105122131410613516107227114328191a10823" +
+    "42b1c11552d1f02433627282090a161718191a25262728292a3435363738393a" +
+    "434445464748494a535455565758595a636465666768696a737475767778797a" +
+    "838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7" +
+    "b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1" +
+    "f2f3f4f5f6f7f8f9faffc4001f01000301010101010101010100000000000001" +
+    "02030405060708090a0bffc400b5110002010204040304070504040001027700" +
+    "0102031104052131061241510761711322328108144291a1b1c109233352f015" +
+    "6272d10a162434e125f11718191a262728292a35363738393a43444546474849" +
+    "4a535455565758595a636465666768696a737475767778797a82838485868788" +
+    "898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4" +
+    "c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9" +
+    "faffda000c03010002110311003f00e568a28af9d3f660a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a2" +
+    "8a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2800a28a2803ffd9");
+
+PioneerDDJFLX10Screen._uploadAlbumArt = function(deck) {
+    var hex = this._TEST_JPEG_HEX;
+    var db = this._DECK_BYTE[deck - 1];
+    var jpegSize = hex.length / 2;
+    var SEG1_CAP = 119;
+    var SEG_CAP  = 122;
+    var totalSegs = (jpegSize <= SEG1_CAP) ? 1
+                    : 1 + Math.ceil((jpegSize - SEG1_CAP) / SEG_CAP);
+
+    var hexAt = function(i) { return parseInt(hex.substr(i * 2, 2), 16); };
+    var pos = 0;
+    for (var seg = 1; seg <= totalSegs; seg++) {
+        var p = this._zeros();
+        p[0] = db;
+        p[1] = 0x33;
+        p[2] = seg;
+        p[4] = totalSegs;
+        if (seg === 1) {
+            p[6] = jpegSize & 0xff;
+            p[7] = (jpegSize >> 8) & 0xff;
+            var take = Math.min(SEG1_CAP, jpegSize - pos);
+            for (var j = 0; j < take; j++) { p[9 + j] = hexAt(pos + j); }
+            pos += take;
+        } else {
+            var take2 = Math.min(SEG_CAP, jpegSize - pos);
+            for (var k = 0; k < take2; k++) { p[6 + k] = hexAt(pos + k); }
+            pos += take2;
+        }
+        this._send(p);
     }
+};
 
-    var streamLen   = stream.length;
-    var PAYLOAD     = PioneerDDJFLX10Screen._SEG_PAYLOAD;
-    var SEGS_PER_SF = PioneerDDJFLX10Screen._SEGS_PER_SUB;
-    var MAX_BYTES   = SEGS_PER_SF * PAYLOAD; // 255*122 = 31110
+
+// ===== xx 36 — PWV5 waveform upload ========================================
+// Test pattern: bright solid red, max height across the whole track length.
+// To swap in real Mixxx waveform data: replace _generateEntries with a function
+// that returns LE16 PWV5 bytes derived from the loaded track.
+PioneerDDJFLX10Screen._generateEntries = function(durationSec) {
+    var n = Math.floor(durationSec * 150);
+    var out = [];
+    var r = 7, g = 0, b = 0, h = 31;
+    var v = (r << 13) | (g << 10) | (b << 7) | (h << 2);
+    var lo = v & 0xff;
+    var hi = (v >> 8) & 0xff;
+    for (var i = 0; i < n; i++) { out.push(lo); out.push(hi); }
+    return out;
+};
+
+PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec) {
+    var db = this._DECK_BYTE[deck - 1];
+    var entryBytes = this._generateEntries(durationSec);
+    var nEntries = entryBytes.length / 2;
+    var ENTRIES_PER_PKT = 19;
 
     var pos = 0;
-    var subframe = 0;
-    var totalSent = 0;
-
-    while (pos < streamLen && subframe < 2) {
-        var sfEnd = pos + Math.min(MAX_BYTES, streamLen - pos);
-        var seg = 1;
-        while (pos < sfEnd) {
-            var pkt = PioneerDDJFLX10Screen._buildPkt(deckByte, 0x38, seg, subframe, 0xD9);
-            pkt[5] = 0x01;
-            for (j = 0; j < PAYLOAD; j++) {
-                pkt[6 + j] = (pos + j < sfEnd) ? stream[pos + j] : 0;
-            }
-            PioneerDDJFLX10Screen._send(pkt);
-            pos += PAYLOAD;
-            seg++;
-            totalSent++;
-            if (seg > 255) { break; }
+    while (pos < nEntries) {
+        var take = Math.min(ENTRIES_PER_PKT, nEntries - pos);
+        var p = this._zeros();
+        p[0]  = db;
+        p[1]  = 0x36;
+        p[2]  = 0x01;     // CONSTANT — not a segment counter
+        p[4]  = 0x01;
+        p[6]  = 0x13;
+        p[10] =  pos        & 0xff;
+        p[11] = (pos >> 8)  & 0xff;
+        p[12] = (pos >> 16) & 0xff;
+        p[13] = (pos >> 24) & 0xff;
+        for (var j = 0; j < take * 2; j++) {
+            p[14 + j] = entryBytes[pos * 2 + j];
         }
-        subframe++;
+        this._send(p);
+        pos += take;
     }
-
-    console.log("FLX10 screen: deck " + deck + " — sent " + totalSent +
-                " xx 38 packets (" + nEntries + " entries, " + streamLen + " stream bytes)");
 };
 
 
-// ----- Track load handler ---------------------------------------------------
-PioneerDDJFLX10Screen.onTrackLoad = function(deck) {
-    var dur = engine.getValue("[Channel" + deck + "]", "duration");
-    if (!(dur > 0)) { return; }
-    // Cap test waveform at 30s of data (no point uploading whole tracks while we're debugging)
-    var testDur = Math.min(dur, 30);
-    var entries = PioneerDDJFLX10Screen._generateWaveformEntries(testDur);
+// ===== Track-load handler ===================================================
+PioneerDDJFLX10Screen._onTrackLoad = function(deck) {
+    var group = "[Channel" + deck + "]";
+    // DIAGNOSTIC: log all candidate COs so we can figure out which one
+    // matches what Mixxx's UI timer displays. The user reports a constant
+    // 14-20s offset between our (playposition × duration) calc and what
+    // Mixxx UI shows — possibly intro/outro marker driven.
+    var duration = engine.getValue(group, "duration");
+    var pos      = engine.getValue(group, "playposition");
+    var cue      = engine.getValue(group, "cue_point");
+    var samples  = engine.getValue(group, "track_samples");
+    var sr       = engine.getValue(group, "track_samplerate");
+    var intro_s  = engine.getValue(group, "intro_start_position");
+    var intro_e  = engine.getValue(group, "intro_end_position");
+    var outro_s  = engine.getValue(group, "outro_start_position");
+    var outro_e  = engine.getValue(group, "outro_end_position");
     console.log("FLX10 screen: track loaded on deck " + deck +
-                " (" + Math.round(dur) + "s real, sending " + Math.round(testDur) +
-                "s test pattern, " + entries.length + " entries)");
-    PioneerDDJFLX10Screen._uploadOverview(deck);
-    PioneerDDJFLX10Screen._uploadWaveform(deck, entries);
+                " | duration=" + duration + " pos=" + pos +
+                " cue_point=" + cue + " samples=" + samples + " sr=" + sr +
+                " intro_s=" + intro_s + " intro_e=" + intro_e +
+                " outro_s=" + outro_s + " outro_e=" + outro_e);
+    // Daemon handles xx 30/35/39/33/2f init + xx 36 wave upload.
+    // screen.js's only HID job is the xx 27 state ping.
 };
 
 
-// ----- Mixxx lifecycle ------------------------------------------------------
+// ===== Lifecycle ============================================================
 PioneerDDJFLX10Screen.init = function(id) {
-    // xx 21 metadata — required by all working implementations, 50 Hz
-    PioneerDDJFLX10Screen._metadataTimer = engine.beginTimer(
-        PioneerDDJFLX10Screen._METADATA_MS,
-        PioneerDDJFLX10Screen._metadataTick,
+    console.log("FLX10 screen v2.0 (xx 27 only, daemon handles wave): init");
+
+    // We no longer prime xx 30 / xx 39 here — the daemon does that.
+    // Just start the 50 Hz xx 27 state ping (the only HID work this module
+    // does in the new architecture).
+    this._stateTimer = engine.beginTimer(
+        this._STATE_MS,
+        function() { PioneerDDJFLX10Screen._sendStateAllDecks(); },
         false
     );
 
-    if (PioneerDDJFLX10Screen._ENABLE_HEARTBEAT) {
-        PioneerDDJFLX10Screen._heartbeatTimer = engine.beginTimer(
-            PioneerDDJFLX10Screen._HEARTBEAT_MS,
-            PioneerDDJFLX10Screen._heartbeat,
-            false
-        );
-    }
-
-    for (var d = 1; d <= 4; d++) {
+    // Track-load detection only — xx 27 updates come from the timer above
+    // (NOT event-driven, because Mixxx throttles makeConnection callbacks
+    // on playposition).
+    for (var dd = 1; dd <= 4; dd++) {
         (function(deck) {
             engine.makeConnection(
                 "[Channel" + deck + "]",
@@ -278,27 +439,23 @@ PioneerDDJFLX10Screen.init = function(id) {
                 function(value) {
                     if (value > 0 && value !== PioneerDDJFLX10Screen._lastDuration[deck]) {
                         PioneerDDJFLX10Screen._lastDuration[deck] = value;
-                        PioneerDDJFLX10Screen.onTrackLoad(deck);
+                        var bpm = engine.getValue("[Channel" + deck + "]", "bpm");
+                        if (bpm > 0) { PioneerDDJFLX10Screen._deckBpm[deck] = bpm; }
+                        PioneerDDJFLX10Screen._onTrackLoad(deck);
                     }
                 }
             );
-        })(d);
+        })(dd);
     }
-
-    console.log("FLX10 screen v0.5 (xx21 metadata + xx37 overview + xx38 waveform): HID mapping started");
 };
 
 PioneerDDJFLX10Screen.shutdown = function() {
-    if (PioneerDDJFLX10Screen._metadataTimer !== null) {
-        engine.stopTimer(PioneerDDJFLX10Screen._metadataTimer);
-        PioneerDDJFLX10Screen._metadataTimer = null;
+    console.log("FLX10 screen: shutdown");
+    if (this._stateTimer !== null) {
+        engine.stopTimer(this._stateTimer);
+        this._stateTimer = null;
     }
-    if (PioneerDDJFLX10Screen._heartbeatTimer !== null) {
-        engine.stopTimer(PioneerDDJFLX10Screen._heartbeatTimer);
-        PioneerDDJFLX10Screen._heartbeatTimer = null;
-    }
-    console.log("FLX10 screen: HID mapping stopped");
 };
 
-// ACK packets (xx D8 ...) arrive here; we don't need to act on them.
+// ACK packets (xx D8 ...) arrive on EP4 IN; we don't need to act on them.
 PioneerDDJFLX10Screen.incomingData = function(data, length) {};
