@@ -32,14 +32,50 @@ var PioneerDDJFLX10Screen = {};
 
 PioneerDDJFLX10Screen._DECK_BYTE     = [0x10, 0x20, 0x30, 0x40];
 PioneerDDJFLX10Screen._STATE_BYTE_31 = {0x10: 0x02, 0x20: 0x01, 0x30: 0x04, 0x40: 0x03};
-PioneerDDJFLX10Screen._STATE_MS      = 100;    // 10 Hz xx 27 timer — using
-                                               // engine.beginTimer (unconditional)
-                                               // because Mixxx THROTTLES makeConnection
-                                               // callbacks on playposition (per the
-                                               // comment in scripts.js line ~159).
-                                               // Event-driven approach was unreliable
-                                               // because the underlying CO callback
-                                               // fired less often than expected.
+PioneerDDJFLX10Screen._STATE_MS      = 100;    // 10 Hz xx 27 timer.
+                                               // BPM/position update each tick (real-time).
+                                               // Time bytes refresh from cache every
+                                               // _TIME_REFRESH_MS via _getCachedTimeBytes.
+PioneerDDJFLX10Screen._TIME_REFRESH_MS = 1000; // 1 Hz re-seed of firmware's time counter.
+// FLX10 vs Mixxx UI fixed offset compensation (seconds).
+// playposition CO returns the engine's processing position; Mixxx UI shows
+// the position adjusted for output-audio latency (audio buffer + DAC).
+// Measured 2026-05-24: FLX10 was 0.96s "behind" Mixxx UI on a paused track
+// (first tried 0.66 then bumped after residual gap). Likely audio buffer +
+// display refresh + scripts.js timer-tick latency combined.
+// Adjust if your audio buffer setting differs.
+PioneerDDJFLX10Screen._TIME_OFFSET_SEC = 0.96;
+PioneerDDJFLX10Screen._cachedTimeBytes = {1: null, 2: null, 3: null, 4: null};
+PioneerDDJFLX10Screen._lastTimeRefresh = {1: 0, 2: 0, 3: 0, 4: 0};
+
+PioneerDDJFLX10Screen._getCachedTimeBytes = function(deckNum, pos, duration) {
+    var now = Date.now();
+    if (this._cachedTimeBytes[deckNum] === null ||
+        now - this._lastTimeRefresh[deckNum] >= this._TIME_REFRESH_MS) {
+        this._lastTimeRefresh[deckNum] = now;
+        if (duration > 0) {
+            var pClamped = pos;
+            if (pClamped < 0.0) pClamped = 0.0;
+            if (pClamped > 1.0) pClamped = 1.0;
+            var remainingSec = duration * (1.0 - pClamped);
+            var totalMs = Math.round(remainingSec * 1000);
+            if (totalMs < 0) totalMs = 0;
+            var minutes = Math.floor(totalMs / 60000);
+            var remMs   = totalMs % 60000;
+            var seconds = Math.floor(remMs / 1000);
+            var ms      = remMs % 1000;
+            this._cachedTimeBytes[deckNum] = [
+                minutes & 0xFF,
+                seconds & 0xFF,
+                ms & 0xFF,
+                (ms >> 8) & 0xFF
+            ];
+        } else {
+            this._cachedTimeBytes[deckNum] = [0x06, 0x1b, 0xfa, 0x01];
+        }
+    }
+    return this._cachedTimeBytes[deckNum];
+};
 PioneerDDJFLX10Screen._WAVE_DURATION = 30;     // seconds of test-pattern waveform
 PioneerDDJFLX10Screen._lastDuration  = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10Screen._stateTimer    = null;
@@ -107,16 +143,20 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
         // Static loaded markers (verified from Serato capture)
         p[29] = 0x92;
 
-        // Remaining time: [9]=min, [10]=sec, [11,12] LE16=ms.
-        // No compensation — testing whether the unconditional timer (vs
-        // throttled CO callback) is the root cause of the drift we saw.
+        // Time bytes: [9]=min, [10]=sec, [11,12] LE16=ms (REAL REMAINING,
+        // recomputed each tick). When position bytes [5..7] are ZERO,
+        // firmware uses these directly — display matches Mixxx exactly.
+        // (When position bytes are non-zero, firmware uses its own counter
+        // derived from position, and time drifts. That's the trade-off:
+        // accurate time OR scrolling wave, not both.)
         if (duration > 0) {
             var pClamped = pos;
             if (pClamped < 0.0) pClamped = 0.0;
             if (pClamped > 1.0) pClamped = 1.0;
-            var remainingSec = duration * (1.0 - pClamped);
+            // Subtract fixed offset to match Mixxx UI's audio-latency-adjusted time
+            var remainingSec = duration * (1.0 - pClamped) - this._TIME_OFFSET_SEC;
+            if (remainingSec < 0) remainingSec = 0;
             var totalMs = Math.round(remainingSec * 1000);
-            if (totalMs < 0) totalMs = 0;
             var minutes = Math.floor(totalMs / 60000);
             var remMs   = totalMs % 60000;
             var seconds = Math.floor(remMs / 1000);
@@ -137,19 +177,13 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             p[14] = (Math.round(frac * 10) & 0x0F) << 4;
         }
 
-        // Playhead position BE24 = pos × duration × 128 (drives wave scroll).
-        // Previously we sent ZEROS here to force firmware to use [9..12]
-        // time bytes (because position bytes also drive time interpretation,
-        // causing drift). Now testing whether Serato-mode SysEx (sent by
-        // scripts.js init, 2026-05-24) decouples them so both work.
-        if (duration > 0) {
-            var posValue = Math.floor(pos * duration * this._POS_RATE);
-            if (posValue < 0) posValue = 0;
-            if (posValue > 0xFFFFFF) posValue = 0xFFFFFF;
-            p[5] = (posValue >> 16) & 0xFF;
-            p[6] = (posValue >> 8) & 0xFF;
-            p[7] = posValue & 0xFF;
-        }
+        // Position bytes ZERO — REQUIRED for accurate time display.
+        // The firmware uses [5..7] for both wave-scroll AND time computation.
+        // When non-zero, time drifts (firmware derives time from position
+        // via a non-1x rate we haven't decoded). User priority is exact
+        // time, so we leave these zero. Wave shape still renders (daemon's
+        // xx 36 upload), just doesn't scroll.
+        p[5] = 0; p[6] = 0; p[7] = 0;
     } else {
         p[29] = 0x80;
     }

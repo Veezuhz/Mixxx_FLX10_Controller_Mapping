@@ -21,9 +21,9 @@ Rekordbox.
    - `PioneerDDJFLX10-screen.js`     — HID screen mapping (xx 27 state ping)
    - `PioneerDDJFLX10-screen.hid.xml` — HID screen descriptor
 
-3. Copy the daemon directory into `~/.mixxx/controllers/`:
-   - `DDJ-FLX10 Screen Protocol/`    — contains `flx10_screen_daemon.py`
-   - `flx10_unlock_v2.py`             — one-time vendor unlock script
+3. Copy the daemon and unlock script into `~/.mixxx/controllers/`:
+   - `flx10_screen_daemon.py`     — the waveform daemon
+   - `flx10_unlock_v2.py`         — one-time vendor unlock script
 
 4. In **Mixxx → Preferences → Controllers**, enable BOTH controllers:
    - `DDJ-FLX10 PROD` (the MIDI mapping)
@@ -42,7 +42,7 @@ Rekordbox.
 
 7. Start the daemon:
    ```bash
-   sudo python3 -u "~/.mixxx/controllers/DDJ-FLX10 Screen Protocol/flx10_screen_daemon.py" --unlock 2>&1 | tee /tmp/daemon.log
+   sudo python3 -u ~/.mixxx/controllers/flx10_screen_daemon.py --unlock 2>&1 | tee /tmp/daemon.log
    ```
 
 Load a track in Mixxx → the FLX10 jog screens should display a real waveform,
@@ -123,17 +123,27 @@ interface claim).
 
 ## Known limitations
 
-### Wave-scroll vs accurate-time tradeoff
+### Wave doesn't scroll during playback
 
 The firmware uses xx 27 bytes `[5..7]` (position) for **both** wave-scroll
-position AND time-display computation. Discovered 2026-05-24 by
-experiment: zero `[5..7]` → time accurate, wave static; real `[5..7]` →
-wave scrolls, time drifts with elapsed.
+AND time-display interpretation. When those bytes are non-zero, wave scrolls
+but time drifts catastrophically (firmware derives time from position at a
+non-1x internal rate). When zero, time matches Mixxx exactly but wave is
+static.
 
-**Current default:** real position bytes (wave scrolls, time may drift
-during playback). If you prefer accurate time over scrolling wave, set
-`p[5] = p[6] = p[7] = 0` in `PioneerDDJFLX10Screen._buildState` in
-`PioneerDDJFLX10-screen.js`.
+**Current default: position bytes = 0** (DJ-priority is exact time). Wave
+shape still renders so you can see the track's structure. To re-enable
+wave-scroll (and accept time drift), restore the `p[5]/[6]/[7]` encoding in
+`PioneerDDJFLX10Screen._buildState` in `PioneerDDJFLX10-screen.js`.
+
+### Time has a fixed ~1s offset from Mixxx UI
+
+Even with position bytes zeroed, the FLX10 time display lagged Mixxx UI by
+~1 second. Cause unclear (audio buffer is only 23ms at 44.1kHz, so it
+shouldn't be that). Likely a combination of Mixxx UI smoothing + JS timer
+tick rounding + firmware display refresh. We compensate by subtracting a
+fixed constant `_TIME_OFFSET_SEC` (default 0.96) from the computed
+remaining time. Tune to your setup if needed.
 
 ### 2-minute wave reset
 
@@ -162,7 +172,7 @@ daemon's `--unlock` flag does this on startup; the standalone
 
 ---
 
-## Open research: Serato-mode SysEx (added 2026-05-24)
+## Serato-mode SysEx (added 2026-05-24 — partial breakthrough)
 
 While analyzing `flx10-driverrutil-then-serato.pcapng`, we discovered Serato
 sends **5+ additional SysEx commands** we weren't sending:
@@ -176,15 +186,22 @@ F0 00 40 05 00 00 04 01  00 0b 31 00 00 00 00 00  F7   # global B
 F0 00 40 05 00 00 04 01  00 0c 00 00 02 0e 0e 05 00 01 F7   # global C
 ```
 
-Hypothesis: one of these puts the firmware into a "Serato-aware" mode where
-time is computed internally from BPM + position, decoupling wave-scroll from
-time display. These are sent at scripts.js init (search for `_SYSEX_DECK_INIT`,
-`_SYSEX_GLOBAL_B`, `_SYSEX_GLOBAL_C`).
+Adding these to our scripts.js init **partially decoupled wave-scroll from
+time-display**. Before: wave-scroll → 35+ second time drift that grew over
+playback. After: wave scrolls AND time is in the right ballpark (~20s
+inconsistent wobble). This is the current state.
 
-If this works → wave scrolls AND time stays accurate.
-If it doesn't help → next step is testing each SysEx in isolation, and
-looking at later per-track SysEx updates (`02 0f 04 0b`, `03 00 05 05`,
-`03 00 01 02`, `03 01 0e 04`) which appear to be per-track configuration.
+Search for `_SYSEX_DECK_INIT`, `_SYSEX_GLOBAL_B`, `_SYSEX_GLOBAL_C` in
+scripts.js.
+
+### Remaining open question
+
+We still don't fully understand the 20s wobble. Possibilities:
+- One of the SysEx payloads above needs the per-track variant (Serato sends
+  later per-deck updates like `02 0f 04 0b`, `03 00 05 05` — these appear to
+  be per-loaded-track config and we send the generic `02 0e 0e 05` always)
+- USB queue depth variability causing packet processing jitter
+- Firmware re-syncing its internal time counter occasionally
 
 ---
 
@@ -195,8 +212,11 @@ looking at later per-track SysEx updates (`02 0f 04 0b`, `03 00 05 05`,
 | `PioneerDDJFLX10-screen.js` | HID screen mapping (xx 27 with live data) |
 | `PioneerDDJFLX10-screen.hid.xml` | HID controller descriptor |
 | `flx10_unlock_v2.py` | Vendor unlock (once per plug-in) |
-| `DDJ-FLX10 Screen Protocol/flx10_screen_daemon.py` | Waveform daemon |
+| `flx10_screen_daemon.py` | Waveform daemon (production) |
+| `DDJ-FLX10 Screen Protocol/` | Research / experimental scripts + screen-protocol findings |
+| `DDJ-FLX10 Screen Protocol/FLX10-SCREEN-PROTOCOL-FINDINGS.md` | Long-form reverse-engineering notes |
 | `DDJ-FLX10 Screen Protocol/flx10_prerender_waveform.py` | Standalone PWV5 cache (older path) |
+| `findings/FLX10-INTEGRATION-NOTES.md` | General Mixxx integration notes |
 | `FLX10-SCREEN-PROTOCOL-FINDINGS.md` | Long-form reverse-engineering notes |
 
 ---
