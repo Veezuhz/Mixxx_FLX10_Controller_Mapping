@@ -2,6 +2,52 @@
 // HID jog wheel screen module for the DDJ-FLX10.  Loaded by
 // PioneerDDJFLX10-screen.hid.xml as a separate HID controller mapping.
 //
+// ====================================================================
+// CHANGE LOG
+// ====================================================================
+// 2026-05-26 (late-night session):
+//   * Byte 29 CAMELOT KEY encoding cracked. Full 24-key lookup table
+//     wired to Mixxx's file_key CO. First DJ controller in Mixxx to
+//     display real per-track Camelot keys on the FLX10 jog screen.
+//     Pattern: even bytes 0x82..0x96 = A-side (minor), odd bytes
+//     0x81..0x97 = B-side (major); each +2 step advances Camelot
+//     number by +7 mod 12 (circle of fifths). 0x80 / 0x99 = "no key"
+//     markers. See memory:flx10-protocol-full-decode for full table.
+//   * Conditional MODE TOGGLE: byte 3/19/29/trailer adapt based on
+//     `file_bpm > 0`. Tracks with beatgrid → theparade mode (b3=0x88,
+//     b19=0x07, trailer ad/05/00). Tracks without → smoothplay mode
+//     (b3=0x80, b19=0, trailer e0/01/00). Matches Serato's two modes
+//     across 10+ captures.
+//   * Byte 21 anchored to FILE-TIME × 2048/sec (was wall-time × 125).
+//     Fixes wave-needle "swim" when tempo slider moves AND eliminates
+//     the "smooth 2 bars then jump 2 bars" artifact (125/sec wrapped
+//     every 2.048s ≈ 2 bars at 124 BPM; 2048/sec wraps every 125ms,
+//     sub-perceptible). 2048/sec is Serato's measured active-play
+//     rate from theparade capture (8 wraps over 0.987s).
+//   * Bytes 8, 18, 22 held at 0 to eliminate the "wave content
+//     flashes to track-start every 4 beats" artifact. Cycling these
+//     (Serato's pattern) put firmware into beat-aligned-redraw mode
+//     that we couldn't align cleanly.
+//   * Byte 7 → 256/sec (was 1024/sec). Wraps once per second at the
+//     byte-6 increment boundary instead of 4x per second mid-second,
+//     killing the 4 Hz wave-needle shimmer.
+//   * Forward-only interp logic: don't reset _lastPosTime if real pos
+//     hasn't passed our extrapolation. Fixes the "-2 then +4" jitter.
+//   * Removed diagnostic logs (FLASH, SWEEP, KEY) after cleanup.
+//
+// OPEN ITEMS (next session):
+//   * Millisecond-scale wave-needle ticking. Probably the update-rate
+//     bottleneck: JS xx 27 at 200 Hz but Mixxx playposition CO updates
+//     at audio-buffer rate (~43 Hz). Visible quantization between Mixxx
+//     ticks. Worth: faster CO polling, interp smoothing tweaks, daemon
+//     refresh-rate bump from 127ms.
+//   * Byte 18 measure-counter (0..5 cycling in theparade mode) is
+//     held at 0 for now. Cycling caused wave-flash without proper beat
+//     alignment from Mixxx; would need beat_distance CO integration.
+//   * Bytes 23, 24, 26-28 confirmed always-zero in 9+ Serato captures.
+//     Reserved/unused — do not touch.
+// ====================================================================
+//
 // This v1.0 module is the result of multi-day reverse engineering that
 // culminated 2026-05-23.  Every packet here is byte-for-byte verified against
 // captures from Serato DJ Pro driving the same FLX10 hardware.  When the
@@ -107,29 +153,51 @@ PioneerDDJFLX10Screen._deckFromDeckByte = function(deckByte) {
     return 0;
 };
 
-// ===== xx 27 — per-deck state ping (sent at 50 Hz to all 4 decks) ===========
+// ===== xx 27 — per-deck state ping (sent at 200 Hz to all 4 decks) ==========
 // Reads pos / duration / BPM directly from Mixxx COs each tick — no log-tail
-// lag (which was the source of the 5-20s timer drift in the daemon-only
-// architecture). Verified protocol byte layout (cracked 2026-05-23):
-//   [5..7]  BE24 = elapsed × 128 (playhead marker position)
-//   [9..12] = remaining MM:SS:ms (firmware also uses these as the "loaded"
-//             gate — if all zero, wave display drops)
-//   [13]    = BPM integer
-//   [14]    high nibble = BPM decimal tenths (low nibble unused)
-// POS_RATE = units per real second of elapsed time, packed BE24 into [5..7].
-// Back to 128 (daemon-era proven value for wave-needle 1x scroll). The
-// previous 128→181→256→150 calibration tests were all done WITHOUT the
-// playback-mode flags ([15]=0x07, [16]=0x26, [17]=0x00) set. With those
-// now in place, the firmware should honor our [9..12] time bytes directly,
-// making POS_RATE a wave-only concern.
-// 2026-05-25 v7: FINAL CALIBRATION
+// lag.
+//
+// CURRENT byte map (verified 2026-05-26 — see file header CHANGE LOG):
+//   [0]      Deck byte 0x10/0x20/0x30/0x40
+//   [1]      0x27 (packet type)
+//   [2]      0xb4 (const)
+//   [3]      Mode flag: 0x88 (theparade mode) / 0x80 (smoothplay)
+//   [4]      0x01 (const)
+//   [5..7]   ELAPSED time as min / sec-in-min / sub-sec(256/sec, wraps at 1s)
+//   [8]      Eighth-note counter (we HOLD AT 0 — cycling causes wave-flash)
+//   [9..12]  REMAINING time: min(1B) / sec(1B) / ms LE16
+//            ⚠ if [9..12] all zero, firmware drops the entire wave display
+//   [13]     BPM integer
+//   [14]     BPM frac × 16 (high nibble) — low nibble unused
+//   [15..17] Tempo % offset: LE16 of (rate_ratio-1)*100*100; [15] = 0
+//   [18]     Measure counter (we HOLD AT 0 — cycling causes wave-flash)
+//   [19]     Beat-grid-active flag: 0x07 (theparade) / 0x00 (smoothplay)
+//   [20]     0x0e (const)
+//   [21]     Wave-entry counter: FILE-time × 2048/sec & 0xFF (Serato rate)
+//   [22]     Sixteenth counter (we HOLD AT 0 — cycling causes wave-flash)
+//   [23,24]  Reserved (always 0 in 9+ Serato captures — DO NOT TOUCH)
+//   [25]     0x80 (const)
+//   [26..28] Reserved (always 0 — DO NOT TOUCH)
+//   [29]     CAMELOT KEY (see MIXXX_KEY_TO_B29 lookup in _buildState).
+//            Also doubles as "loaded marker" — 0x80 = empty deck.
+//   [30]     0x0d (const)
+//   [31]     Deck state byte (see _STATE_BYTE_31 table)
+//   [32..34] Trailer: ad/05/00 (theparade) / e0/01/00 (smoothplay)
+// ==== _POS_RATE: DEAD CODE as of 2026-05-26 — DO NOT TUNE ====
+// This constant is no longer referenced. Kept ONLY for the calibration
+// values in comments (they may be useful if someone re-tries BE24-encoded
+// bytes 5..7). The current production encoding writes bytes 5..7 as
+// min/sec/sub-sec time-display fields, not as a BE24 wave-needle counter.
+// The wave-needle position now comes from byte 21 (file-time × 2048/sec)
+// and from xx 36 packets sent by the daemon.
+//
+// HISTORICAL calibration (when bytes 5..7 WERE BE24 = elapsed × _POS_RATE):
 //   POS_RATE=250 → -1.5s drift / 60s
 //   POS_RATE=256 → -0.5s drift / 60s
-//   POS_RATE=258 → -0.2s drift / 60s (FLX10 slow)
-//   POS_RATE=260 → +0.2s drift / 60s (FLX10 fast), IDENTICAL at tempo 0/+5/-5
-// Tempo scaling math is correct (drift constant across pitches).
-// Linear fit: firmware ≈ 259.14 → set 259 for near-zero drift.
-PioneerDDJFLX10Screen._POS_RATE = 259.0;   // ticks per second
+//   POS_RATE=258 → -0.2s drift / 60s
+//   POS_RATE=260 → +0.2s drift / 60s   (IDENTICAL at tempo 0/+5/-5)
+//   Linear fit: firmware rate ≈ 259.14 → 259 gives near-zero drift.
+PioneerDDJFLX10Screen._POS_RATE = 259.0;   // unused — see above
 
 // SCREEN MODE — pivot 2026-05-24. 'serato' uses xx 27 (legacy, drift issue).
 // 'rekordbox' uses xx 21 + xx 3D heartbeat. 'vdj' uses xx 21 (different play
@@ -375,14 +443,16 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             // attempt also breaks time, revert to 1024/sec and accept the
             // shimmer until we find another wave-needle source byte.
             p[7] = Math.floor((smoothMs % 1000) * 256 / 1000) & 0xFF;
-            // 2026-05-25: byte [21] re-enabled as wave-entry index low byte
-            // (elapsed × 150 fps % 256). Serato ticks this byte at 150/sec
-            // continuously. Hypothesis: this is the firmware's TRUE time
-            // reference and compensates for position-byte drift.
-            // byte [21] = wave-entry counter at exactly 125/sec (Serato rate).
-            // Zeroing it didn't change wave behavior, so restore. Confirmed
-            // not the source of 2 jumps/sec we see.
-            var waveIdx = Math.floor(smoothElapsed * 125);
+            // Byte 21 — wave-entry / play-progress counter. Two key choices:
+            //   (a) FILE-time anchor (not wall-time / smoothElapsed). Tempo
+            //       slider can't shift byte 21 because file-position doesn't
+            //       move when only tempo changes → no "wave swims with tempo".
+            //   (b) Rate 2048/sec: measured Serato active-play rate from
+            //       flx10-serato-theparade-steady-play.pcapng (8 wraps over
+            //       0.987s = 2076/sec). Wraps every 125ms — sub-perceptible.
+            //       Previous 125/sec wrapped every 2.048s → user-visible as
+            //       "smooth for 2 bars then jump 2 bars".
+            var waveIdx = Math.floor(fileElapsedSec * 2048);
             p[21] = waveIdx & 0xFF;
             // Beat counters per Serato pattern:
             //   byte 8  = eighth-note counter (0..3, cycles every 2 beats)

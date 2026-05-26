@@ -3,6 +3,32 @@
 flx10_screen_daemon.py — long-running daemon that drives the FLX10 jog wheel
 screens with real waveforms from whatever Mixxx is currently playing.
 
+====================================================================
+CHANGE LOG
+====================================================================
+2026-05-26 (late-night session):
+  * Hardened interp_pos() against rate spikes. Earlier versions caused
+    "wave content flashes to track-start" because a burst of FLX10_POS
+    log lines arriving close together produced huge extrapolation rates,
+    overshooting to 0.0 or 1.0 for several xx 36 packets in a row.
+    Guards now: dt_log must be in [10ms, 500ms]; |rate| must be ≤ 0.5/s;
+    extrapolation capped at a 30ms step. Holds last_pos_val otherwise.
+  * RefreshThread (xx 36 trickle): switched from raw st.pos to interp_pos
+    so wave-entry advances smoothly between Mixxx's ~100ms position ticks
+    instead of in 100ms stair-steps.
+  * Removed all diagnostic logs ([FLASH?], [XX36] verbose entry log,
+    SEEK-detected log, on_track_load echo) after the wave-flash and
+    position-anomaly debugging was complete.
+
+2026-05-25 and earlier:
+  * xx 35 sends true PWV5 entry count (was 0).
+  * xx 30 includes wall-clock duration at bytes [6..9].
+  * xx 2f beat-grid encoding (4-byte records at 22050 Hz sample positions).
+  * RefreshThread interval = 0.127s (8 Hz), matches Serato's measured cadence.
+  * Adaptive PWV5 frame rate to fit firmware's ~24500-entry buffer.
+====================================================================
+
+
 Architecture:
   Mixxx (MIDI mapping) ──► mixxx.log (FLX10_TRACK_LOAD lines)
                               │
