@@ -84,10 +84,15 @@ MIXXX_LOG        = os.path.join(_HOME, ".mixxx", "mixxx.log")
 MIXXX_DB         = os.path.join(_HOME, ".mixxx", "mixxxdb.sqlite")
 MIXXX_ANALYSIS   = os.path.join(_HOME, ".mixxx", "analysis")
 SEG_PAYLOAD      = 122
-PWV5_FPS         = 150     # Pioneer PWV5 entry rate. Firmware computes
-                           # entry_index from xx 27 position bytes assuming
-                           # this rate, so changing it misaligns the playhead
-                           # marker from the visible waveform.
+PWV5_FPS_NOMINAL = 150     # Pioneer PWV5 spec: 75 frames/sec × 2 half-frames.
+                           # We compute an effective FPS per-track so the
+                           # whole waveform fits in the firmware's ~24,500-
+                           # entry buffer (otherwise wave runs out at ~163 sec
+                           # and needle position misaligns with Mixxx).
+PWV5_FPS         = 150     # back-compat (read by tail_mixxx_log probe)
+FW_WAVE_BUFFER   = 24500   # firmware wave buffer in entries (empirical
+                           # 2026-05-25: at 150 fps user saw wave end at
+                           # 162.3 sec → 24345 entries; rounded to 24500)
 
 # Hardcoded xx 39 packets from the Serato capture, byte-for-byte.
 _XX39_HEX = [
@@ -240,19 +245,44 @@ def interp_pos(st, now=None):
     state-ping at 200 Hz would emit 20 ticks of the same value before jumping,
     causing the waveform/playhead to look stepped. We linearly extrapolate from
     the last two pos updates so the displayed position advances smoothly between
-    Mixxx ticks."""
+    Mixxx ticks.
+
+    CRITICAL: extrapolation must be CAUTIOUS. Earlier versions caused the
+    "wave content flashes to track-start (and to track-end)" artifact by
+    overshooting:
+      - Two FLX10_POS log lines flushed close together produce a tiny dt_log
+        → `rate` blows up → est saturates to 0.0 or 1.0 for the next ~200ms,
+        which makes xx 36 stream entry=0 (track-start) or entry=N-19
+        (track-end) for a burst of packets.
+      - Seeks (clicks in the wave) produce a brief huge `rate`.
+    Guards added 2026-05-25:
+      - dt_log must be in [10ms, 500ms] for extrapolation.
+      - |rate| must be ≤ 0.5/sec (well above 8× playback on a 30s track).
+      - Total extrapolation step is capped at 30ms-worth so even a marginal
+        rate can never overshoot by much."""
     if now is None:
         now = time.time()
     dt = now - st.last_pos_ts
-    # If the last two updates were very recent (track playing), use the observed
-    # rate to extrapolate. Cap dt at 200 ms to avoid runaway if updates stop.
-    if dt < 0.2 and st.prev_pos_ts > 0 and st.last_pos_ts > st.prev_pos_ts:
-        rate = (st.last_pos_val - st.prev_pos_val) / (st.last_pos_ts - st.prev_pos_ts)
-        est = st.last_pos_val + rate * dt
-        if est < 0.0: est = 0.0
-        if est > 1.0: est = 1.0
-        return est
-    return st.last_pos_val
+    if dt < 0.0 or dt > 0.2:
+        return st.last_pos_val
+    if st.prev_pos_ts <= 0:
+        return st.last_pos_val
+    dt_log = st.last_pos_ts - st.prev_pos_ts
+    if dt_log < 0.010 or dt_log > 0.500:
+        # Log lines arrived too close (likely a burst flush of a seek) or too
+        # far apart — extrapolation would be unreliable. Hold last value.
+        return st.last_pos_val
+    rate = (st.last_pos_val - st.prev_pos_val) / dt_log
+    if abs(rate) > 0.5:
+        # Rate implies >0.5 of the track per second — that's a seek, not play.
+        return st.last_pos_val
+    # Cap extrapolation step so we never wander more than ~30ms ahead even if
+    # rate*dt is borderline (defense in depth — clamps to [0,1] still apply).
+    step_dt = dt if dt < 0.030 else 0.030
+    est = st.last_pos_val + rate * step_dt
+    if est < 0.0: est = 0.0
+    if est > 1.0: est = 1.0
+    return est
 
 
 # ===== xx 27 (50 Hz state ping) ============================================
@@ -369,24 +399,42 @@ class RefreshThread(threading.Thread):
     daemon: fast seek response and tight playhead tracking. Both approaches
     hit the same ~2-min waveform reset — that's a firmware-side limit we
     haven't cracked yet."""
-    def __init__(self, ep_out, interval_s=0.2):
+    def __init__(self, ep_out, interval_s=0.127):
         super().__init__(daemon=True)
         self.ep_out   = ep_out
-        self.interval = interval_s   # 5 Hz trickle (down from 20Hz to reduce
-                                     # HID bandwidth contention with screen.js
-                                     # — total ≈ 12 packets/sec across both)
+        self.interval = interval_s   # 2026-05-25 EXPERIMENT: 50 Hz trickle
+                                     # (was 5 Hz). Hypothesis: high-rate xx 36
+                                     # with playhead-tracking offset drives wave
+                                     # scroll INDEPENDENTLY of xx 27 position
+                                     # bytes. If firmware uses xx 36 offset for
+                                     # wave needle (not xx 27), we could get
+                                     # accurate time (xx 27 pos=0) + scrolling
+                                     # wave (high-rate xx 36).
         self._stop    = threading.Event()
 
     def run(self):
+        # Send xx 36 packet at current playhead each tick (NO forward-streaming
+        # cursor — that drifted ahead due to wait() imprecision). The wave
+        # data for the whole track is uploaded at track-load via adaptive
+        # PWV5_FPS that fits the firmware buffer (~24,500 entries).
+        ENTRIES_PER_PKT = 19
         while not self._stop.is_set():
             for d in (1, 2, 3, 4):
                 st = DECKS[d]
                 if not (st.loaded and st.pwv5 and st.duration > 0):
                     continue
                 n_entries = len(st.pwv5) // 2
-                entry = int(st.pos * n_entries)
+                # Use interpolated pos: st.pos only updates every ~100ms via
+                # FLX10_POS logs, so reading raw st.pos here makes our high-rate
+                # xx 36 packets repeat the SAME entry until the next Mixxx tick.
+                # That repetition is what caused the "wave content flashes to
+                # track start" artifact — interp_pos() advances smoothly between
+                # Mixxx updates.
+                ipos = interp_pos(st)
+                entry = int(ipos * n_entries)
                 if entry < 0: entry = 0
-                if entry > n_entries - 19: entry = max(0, n_entries - 19)
+                if entry > n_entries - ENTRIES_PER_PKT:
+                    entry = max(0, n_entries - ENTRIES_PER_PKT)
                 send_pkt(self.ep_out,
                          _xx36_packet(DECK_BYTES[d], entry, st.pwv5))
             self._stop.wait(self.interval)
@@ -397,23 +445,51 @@ class RefreshThread(threading.Thread):
 
 # ===== Track-load upload sequence ==========================================
 
-def send_xx30(ep, deck):
+def send_xx30(ep, deck, duration_sec=0.0):
+    """Send xx 30 init/track-load packet.
+
+    2026-05-25 finding: highbpm Serato capture shows xx 30 includes TRACK
+    LENGTH at bytes [6..9] in the same min/sec/ms-LE16 format as the time
+    bytes. Hypothesis: firmware uses this LENGTH as a reference for time
+    computation, possibly fixing the drift we observed.
+    """
     p = zeros()
     p[0] = DECK_BYTES[deck]
     p[1] = 0x30
     p[2] = 0x01
     p[4] = 0x01
+    # Encode track length at bytes [6..9]: min(1B), sec(1B), ms(LE16)
+    if duration_sec > 0:
+        total_ms = int(round(duration_sec * 1000))
+        minutes = total_ms // 60000
+        rem_ms  = total_ms %  60000
+        seconds = rem_ms   // 1000
+        ms      = rem_ms   %  1000
+        p[6] = minutes & 0xFF
+        p[7] = seconds & 0xFF
+        p[8] = ms & 0xFF
+        p[9] = (ms >> 8) & 0xFF
     for i in (10, 16, 22, 28, 34, 40, 46, 52):
         p[i] = 0xff
     send_pkt(ep, p)
 
 
-def send_xx35(ep, deck):
+def send_xx35(ep, deck, n_entries=0):
+    """xx 35 carries the TOTAL WAVEFORM ENTRY COUNT at bytes [2][3] as LE16.
+    Verified 2026-05-25 from flx10-serato-loading4tracks: deck 0x10 sent
+    `10 35 38 81` (= 33080 = 220.54s × 150 fps for the 220.54s track),
+    deck 0x20 sent `20 35 8a c1` (= 49546 = 330.31s × 150 fps).
+    Firmware uses this count to scale the wave needle position; sending 0
+    causes wave misalignment."""
     db = DECK_BYTES[deck]
     p = zeros(); p[0] = db; p[1] = 0x35
+    p[2] = n_entries & 0xFF
+    p[3] = (n_entries >> 8) & 0xFF
     send_pkt(ep, p)
     for _ in range(2):
-        p = zeros(); p[0] = db; p[1] = 0x35; p[2] = 0x0e; p[3] = 0xe3
+        p = zeros(); p[0] = db; p[1] = 0x35
+        p[2] = n_entries & 0xFF
+        p[3] = (n_entries >> 8) & 0xFF
         send_pkt(ep, p)
 
 
@@ -425,9 +501,152 @@ def send_xx39(ep, deck):
         send_pkt(ep, bytes(p))
 
 
-def send_xx2f(ep, deck):
+# ===== xx 2f beat-grid encoding ============================================
+# Decoded packet layout (128 bytes each):
+#   bytes 0..5  : header  = deck_byte 0x2f seq(1..N) 0x00 0x15 0x00
+#   bytes 6..125: payload = 30 records × 4 bytes  (= 120 bytes)
+#   bytes 126,127: 2 padding bytes (zero)
+# Each record: [beat_type, pos_low, pos_mid, pos_high]
+#   beat_type cycles 0x03,0x04,0x00,0x02 for beats 1,2,3,4 in a 4/4 bar.
+#   position = LE24 sample count at 22050 Hz:
+#       samples = round(beat_time_ms * 22050 / 1000)
+# First record is a fixed marker: [0x80, 0x02, 0x01, 0x00] (samples=258).
+# Serato generates ~22 markers/beat (fine sub-grid); we emit one per beat.
+
+_XX2F_SR        = 22050           # position sample-rate denominator
+_XX2F_BEAT_TYPE = (0x03, 0x04, 0x00, 0x02)   # cycles per 4/4 bar
+_XX2F_RECS_PER_PKT = 30
+_XX2F_MARKER    = (0x80, 0x02, 0x01, 0x00)   # first-record marker (samples=258)
+
+
+def _xx2f_record(beat_idx, beat_time_ms):
+    """Encode one 4-byte beat record."""
+    samples = int(round(beat_time_ms * _XX2F_SR / 1000.0)) & 0xFFFFFF
+    btype = _XX2F_BEAT_TYPE[beat_idx & 0x03]
+    return (btype,
+            samples & 0xFF,
+            (samples >> 8) & 0xFF,
+            (samples >> 16) & 0xFF)
+
+
+def encode_xx2f_packets(deck_byte, beat_times_ms):
+    """Encode a beat-time list into 128-byte xx 2f packets.
+
+    Layout per packet: 6-byte header + 30 × 4-byte records + 2 pad bytes.
+    First record of the entire stream is the fixed 0x80 0x02 0x01 0x00 marker
+    (= samples 258, ~11.7ms at 22050 Hz) — Serato uses this as a track-start
+    sentinel. Remaining records carry one entry per downbeat.
+
+    Returns a list of bytes() packets.
+    """
+    # records = [marker] + one record per beat
+    records = [_XX2F_MARKER]
+    for i, t in enumerate(beat_times_ms):
+        records.append(_xx2f_record(i, t))
+
+    # Chunk into packets of 30 records each.
+    packets = []
+    total_segs = max(1, (len(records) + _XX2F_RECS_PER_PKT - 1) // _XX2F_RECS_PER_PKT)
+    for seg_idx in range(total_segs):
+        chunk = records[seg_idx * _XX2F_RECS_PER_PKT : (seg_idx + 1) * _XX2F_RECS_PER_PKT]
+        p = zeros()
+        # Header: deck 0x2f seq 0x00 0x15 0x00
+        p[0] = deck_byte
+        p[1] = 0x2f
+        p[2] = (seg_idx + 1) & 0xFF
+        p[3] = 0x00
+        p[4] = 0x15
+        p[5] = 0x00
+        # Records start at byte 6.
+        off = 6
+        for rec in chunk:
+            p[off]     = rec[0]
+            p[off + 1] = rec[1]
+            p[off + 2] = rec[2]
+            p[off + 3] = rec[3]
+            off += 4
+        # bytes 126,127 stay zero (padding)
+        packets.append(bytes(p))
+    return packets
+
+
+def send_xx2f(ep, deck, beat_times_ms=None):
+    """Send the xx 2f beat-grid packets for this deck.
+
+    With no beat list, falls back to the original header-only placeholder
+    (kept for callers that just want to register the packet type).
+    """
+    db = DECK_BYTES[deck]
+    if not beat_times_ms:
+        p = zeros()
+        p[0] = db; p[1] = 0x2f; p[2] = 0x01; p[4] = 0x01
+        send_pkt(ep, p)
+        return 0, 1
+    packets = encode_xx2f_packets(db, beat_times_ms)
+    for pkt in packets:
+        send_pkt(ep, pkt)
+    return len(beat_times_ms), len(packets)
+
+
+# ===== Rekordbox-mode init placeholders (added 2026-05-24) ==================
+# Decoded from flx10-rekordbox-opening.pcapng. Rekordbox sends these tiny
+# placeholders per deck at startup BEFORE any track is loaded. The firmware
+# requires them to know "this packet type is supported" — without them,
+# the wave display modes are not selectable from the physical jog buttons.
+# Content is essentially all-zero with just type+segment headers.
+
+def send_xx2d(ep, deck):
+    """xx 2D — purpose unknown, but required for rekordbox init. 1 packet/deck."""
     p = zeros()
-    p[0] = DECK_BYTES[deck]; p[1] = 0x2f; p[2] = 0x01; p[4] = 0x01
+    p[0] = DECK_BYTES[deck]; p[1] = 0x2d; p[2] = 0x01; p[4] = 0x01
+    send_pkt(ep, p)
+
+
+def send_xx3e(ep, deck):
+    """xx 3E — purpose unknown, but required for rekordbox init. 1 packet/deck."""
+    p = zeros()
+    p[0] = DECK_BYTES[deck]; p[1] = 0x3e; p[2] = 0x01; p[4] = 0x01
+    send_pkt(ep, p)
+
+
+def send_xx2c_empty(ep, deck):
+    """xx 2C overview waveform — empty placeholder = 35 zero-payload segments.
+    Pattern: 10 2c NN 00 23 00 ... (byte[4]=0x23=35 total segments)."""
+    db = DECK_BYTES[deck]
+    for seg in range(1, 36):
+        p = zeros()
+        p[0] = db; p[1] = 0x2c; p[2] = seg; p[4] = 0x23
+        send_pkt(ep, p)
+
+
+def send_xx2e_empty(ep, deck):
+    """xx 2E color waveform — empty placeholder. 3 packets/deck per capture."""
+    db = DECK_BYTES[deck]
+    for seg in range(1, 4):
+        p = zeros()
+        p[0] = db; p[1] = 0x2e; p[2] = seg; p[4] = 0x01
+        send_pkt(ep, p)
+
+
+def send_xx3d_display_mode(ep, mode):
+    """Set the FLX10 jog display mode (1..5).
+
+    Captured 2026-05-24 from flx10-rekordbox-menu-modes-cycle.pcapng:
+    rekordbox sends `00 3d MODE 00 05 00 ...` on EP5 to set the jog display
+    mode. The 5 modes observed (per user notes): wave-with-wave2 → wave-only
+    → deck-wave-with-beatgrid → rekordbox-logo → album-artwork.
+
+    Note: the original capture shows rekordbox cycling all 5 values every
+    ~50ms as a heartbeat, so it's possible the firmware only acts on edge
+    transitions and needs the full sequence — but we try the simple
+    "single packet with desired mode" first; if it doesn't work we'll
+    iterate to a full 1→2→…→N sweep.
+    """
+    p = zeros()
+    p[0] = 0x00       # global (not per-deck)
+    p[1] = 0x3d
+    p[2] = mode & 0x0F
+    p[4] = 0x05       # constant from capture
     send_pkt(ep, p)
 
 
@@ -455,7 +674,7 @@ def upload_xx33_album_art(ep, deck, jpeg_bytes):
 
 
 def upload_xx36_waveform(ep, deck, pwv5_bytes):
-    """Full one-shot upload of the whole track's PWV5 waveform."""
+    """Upload the entire (already-fit-to-buffer) waveform at track-load."""
     db = DECK_BYTES[deck]
     n_entries = len(pwv5_bytes) // 2
     ENTRIES_PER_PKT = 19
@@ -465,6 +684,7 @@ def upload_xx36_waveform(ep, deck, pwv5_bytes):
         p = _xx36_packet(db, pos, pwv5_bytes, take)
         send_pkt(ep, p)
         pos += take
+    print(f"  [waveform] uploaded {n_entries} entries at track-load")
 
 
 def _xx36_packet(deck_byte, pos_entries, pwv5_bytes, take=19):
@@ -515,21 +735,40 @@ def get_test_jpeg():
         return bytes.fromhex(_MINIMAL_JPEG_HEX)
 
 
-def handle_track_load(ep, deck, pwv5, label=""):
+def handle_track_load(ep, deck, pwv5, label="", duration_sec=0.0, file_bpm=0.0):
     """Run the full Serato upload sequence with PWV5 bytes for this deck.
     Also caches the PWV5 on the deck state so the scroll thread can do
-    position-update bursts without re-parsing."""
+    position-update bursts without re-parsing.
+    2026-05-25: pass duration_sec so xx 30 carries the track length the
+    firmware may use as a time reference. Also pass file_bpm so we can
+    synthesize a constant-BPM beat grid and send it as xx 2f."""
     if not pwv5:
         print(f"  deck {deck}: empty waveform, skipping upload")
         return
     DECKS[deck].pwv5 = bytes(pwv5)
-    print(f"  deck {deck}: uploading {len(pwv5)} bytes ({len(pwv5)//2} entries) {label}")
-    send_xx30(ep, deck)
+    print(f"  deck {deck}: uploading {len(pwv5)} bytes ({len(pwv5)//2} entries) {label} dur={duration_sec:.1f}s")
+    send_xx30(ep, deck, duration_sec=duration_sec)
     send_xx39(ep, deck)
     upload_xx33_album_art(ep, deck, get_test_jpeg())
-    send_xx35(ep, deck)
+    # xx 35 entry count = duration × 150, matching Serato's pattern.
+    # (Serato sends true entry count for the track at 150 fps even when wave
+    # data extends past the firmware's display buffer.)
+    xx35_entries = int(round(duration_sec * 150))
+    send_xx35(ep, deck, n_entries=xx35_entries)
     upload_xx36_waveform(ep, deck, pwv5)
-    send_xx2f(ep, deck)
+    # xx 2f beat grid — synthesize EIGHTH-NOTE markers (2 per beat) at
+    # constant BPM. Serato's loading capture shows ~2 records per beat across
+    # all decks (analysis 2026-05-25). Variable-BPM via Mixxx BeatGrid-2.0 TODO.
+    if file_bpm and file_bpm > 0 and duration_sec > 0:
+        eighth_interval_ms = 30000.0 / file_bpm   # 8th note = half-beat
+        n_eighths = int(duration_sec * file_bpm * 2 / 60.0)
+        beat_times_ms = [i * eighth_interval_ms for i in range(n_eighths)]
+        n_sent, n_pkts = send_xx2f(ep, deck, beat_times_ms)
+        print(f"[beatgrid] deck {deck}: sent {n_sent} 8th-note markers in "
+              f"{n_pkts} packets (bpm={file_bpm:.2f}, "
+              f"interval={eighth_interval_ms:.2f}ms)")
+    else:
+        print(f"[beatgrid] deck {deck}: skipped (file_bpm={file_bpm}, dur={duration_sec})")
 
 
 # (Removed earlier xx 36 scroll-update thread — turned out the playhead
@@ -645,9 +884,10 @@ def _convert_to_pwv5(visual_sr, values, target_fps=None):
     return out
 
 
-def waveform_for_track(track_id):
-    """Look up the track's Waveform-5.0 analysis_id, parse it, return PWV5 bytes.
-    Returns (None, error_str) on failure."""
+def waveform_for_track(track_id, duration_sec=0.0):
+    """Load PWV5 waveform at canonical 150 fps (Serato/Pioneer spec).
+    Wave covers up to ~163 sec for long tracks (firmware buffer limit) but
+    needle alignment is maintained by sending xx 35 with duration × 150."""
     if not os.path.exists(MIXXX_DB):
         return None, "mixxxdb not found"
     conn = sqlite3.connect(MIXXX_DB)
@@ -661,7 +901,10 @@ def waveform_for_track(track_id):
         return None, f"analysis file missing: {analysis_path}"
     try:
         visual_sr, values = _parse_mixxx_waveform(analysis_path)
-        pwv5 = _convert_to_pwv5(visual_sr, values)
+        pwv5 = _convert_to_pwv5(visual_sr, values, target_fps=150)
+        n_entries = len(pwv5) // 2
+        print(f"  [waveform] produced {n_entries} entries at 150 fps "
+              f"(covers {n_entries/150:.1f}s of audio)")
         return pwv5, None
     except Exception as e:
         return None, f"parse failed: {e}"
@@ -718,9 +961,12 @@ TRACK_LOAD_PATTERN = re.compile(
     r"FLX10_TRACK_LOAD\s+deck=(\d+)\s+samples=([\d.]+)\s+file_bpm=([\d.]+)\s+duration=([\d.]+)")
 POS_PATTERN = re.compile(r"FLX10_POS\s+deck=(\d+)\s+pos=([\d.]+)")
 BPM_PATTERN = re.compile(r"FLX10_BPM\s+deck=(\d+)\s+bpm=([\d.]+)")
+CYCLE_DISPLAY_PATTERN = re.compile(
+    r"FLX10_CYCLE_JOG_DISPLAY\s+side=(left|right)\s+seq=(\d+)")
 
 
-def tail_mixxx_log(log_path, on_track_load, on_pos_update, on_bpm_update):
+def tail_mixxx_log(log_path, on_track_load, on_pos_update, on_bpm_update,
+                   on_cycle_display=None):
     """Tail mixxx.log forever; dispatch FLX10_TRACK_LOAD and FLX10_POS lines.
     Reopens the file if Mixxx rotates it."""
     while not os.path.exists(log_path):
@@ -777,6 +1023,10 @@ def tail_mixxx_log(log_path, on_track_load, on_pos_update, on_bpm_update):
         if m:
             on_bpm_update(int(m.group(1)), float(m.group(2)))
             continue
+        m = CYCLE_DISPLAY_PATTERN.search(line)
+        if m and on_cycle_display is not None:
+            on_cycle_display(m.group(1))   # 'left' or 'right'
+            continue
 
 
 # ===== Main =================================================================
@@ -818,7 +1068,7 @@ def main():
     # Open the hidraw device (non-exclusive — multi-writer via kernel queue)
     ep_out = open_hidraw()
 
-    # Initial per-deck init packets
+    # Initial per-deck init packets (Serato-mode baseline)
     print("Sending xx 30 + xx 39 init to all 4 decks …")
     for d in (1, 2, 3, 4):
         send_xx30(ep_out, d)
@@ -849,7 +1099,6 @@ def main():
     def on_track_load(deck, samples, file_bpm, duration):
         st = DECKS.get(deck)
         if st is None: return
-        # Don't re-upload if this is the same track as currently loaded
         track_id = find_track_id(samples, file_bpm, duration)
         if track_id is None:
             print(f"\n[deck {deck}] track load: samples={samples:.0f} file_bpm={file_bpm} "
@@ -862,13 +1111,14 @@ def main():
         st.duration = duration   # needed for position encoding
         st.loaded   = True
         st.pos      = 0.0
-        print(f"\n[deck {deck}] track load: track_id={track_id}, "
+        print(f"\n[deck {deck}] track load: track_id={track_id} "
               f"samples={samples:.0f} file_bpm={file_bpm} dur={duration:.1f}s")
-        pwv5, err = waveform_for_track(track_id)
+        pwv5, err = waveform_for_track(track_id, duration_sec=duration)
         if err:
             print(f"  deck {deck}: {err}")
             return
-        handle_track_load(ep_out, deck, pwv5, label=f"(track_id={track_id})")
+        handle_track_load(ep_out, deck, pwv5, label=f"(track_id={track_id})",
+                          duration_sec=duration, file_bpm=file_bpm)
 
     def on_pos_update(deck, pos):
         st = DECKS.get(deck)
@@ -892,11 +1142,32 @@ def main():
         if st is None: return
         st.bpm = bpm   # active BPM (pitch-affected) for xx 27 [13]/[15]
 
+    # Jog display mode cycling. State persists per-side. The mode wraps 1..5.
+    # Both sides share the same firmware-side mode in the original captures
+    # (byte [0] = 0x00 = global), so for now both buttons drive a single mode.
+    cycle_state = {"mode": 1}
+    def on_cycle_display(side):
+        cycle_state["mode"] = (cycle_state["mode"] % 5) + 1   # 1→2→3→4→5→1
+        print(f"[cycle-display] side={side} → mode={cycle_state['mode']}", flush=True)
+        # Try sweep approach: send 1..N values (rekordbox cycles all 5 every
+        # 50ms continuously, so firmware may require the full sweep ending on
+        # the desired mode rather than a single set-packet).
+        for m in range(1, cycle_state["mode"] + 1):
+            send_xx3d_display_mode(ep_out, m)
+            time.sleep(0.002)
+
+    # Rekordbox-mode threads (xx 3D heartbeat + xx 2C trickle) — disabled
+    # after the rekordbox-mode pivot hit a firmware auth wall. Kept in code
+    # for future use. To re-enable, set heartbeat_running["on"] = True.
+    heartbeat_running = {"on": False}
+
     try:
-        tail_mixxx_log(args.log, on_track_load, on_pos_update, on_bpm_update)
+        tail_mixxx_log(args.log, on_track_load, on_pos_update, on_bpm_update,
+                       on_cycle_display=on_cycle_display)
     except KeyboardInterrupt:
         print("\nShutting down …")
     finally:
+        heartbeat_running["on"] = False
         if pinger is not None:
             pinger.stop()
             pinger.join(timeout=1)

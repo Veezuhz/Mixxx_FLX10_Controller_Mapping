@@ -32,11 +32,11 @@ var PioneerDDJFLX10Screen = {};
 
 PioneerDDJFLX10Screen._DECK_BYTE     = [0x10, 0x20, 0x30, 0x40];
 PioneerDDJFLX10Screen._STATE_BYTE_31 = {0x10: 0x02, 0x20: 0x01, 0x30: 0x04, 0x40: 0x03};
-PioneerDDJFLX10Screen._STATE_MS      = 100;    // 10 Hz xx 27 timer.
-                                               // BPM/position update each tick (real-time).
-                                               // Time bytes refresh from cache every
-                                               // _TIME_REFRESH_MS via _getCachedTimeBytes.
-PioneerDDJFLX10Screen._TIME_REFRESH_MS = 1000; // 1 Hz re-seed of firmware's time counter.
+PioneerDDJFLX10Screen._STATE_MS      = 5;      // 200 Hz xx 27. Pairs with the
+                                               // patched Mixxx visual_playposition CO
+                                               // (sample-accurate, unthrottled, updates
+                                               // every audio buffer). At 5ms we get many
+                                               // samples per CO update for smooth wave.
 // FLX10 vs Mixxx UI fixed offset compensation (seconds).
 // playposition CO returns the engine's processing position; Mixxx UI shows
 // the position adjusted for output-audio latency (audio buffer + DAC).
@@ -78,6 +78,9 @@ PioneerDDJFLX10Screen._getCachedTimeBytes = function(deckNum, pos, duration) {
 };
 PioneerDDJFLX10Screen._WAVE_DURATION = 30;     // seconds of test-pattern waveform
 PioneerDDJFLX10Screen._lastDuration  = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._lastPos       = {};
+PioneerDDJFLX10Screen._lastPosTime   = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._lastSmoothMs  = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10Screen._stateTimer    = null;
 
 
@@ -113,81 +116,492 @@ PioneerDDJFLX10Screen._deckFromDeckByte = function(deckByte) {
 //             gate — if all zero, wave display drops)
 //   [13]    = BPM integer
 //   [14]    high nibble = BPM decimal tenths (low nibble unused)
-PioneerDDJFLX10Screen._POS_RATE = 128.0;
+// POS_RATE = units per real second of elapsed time, packed BE24 into [5..7].
+// Back to 128 (daemon-era proven value for wave-needle 1x scroll). The
+// previous 128→181→256→150 calibration tests were all done WITHOUT the
+// playback-mode flags ([15]=0x07, [16]=0x26, [17]=0x00) set. With those
+// now in place, the firmware should honor our [9..12] time bytes directly,
+// making POS_RATE a wave-only concern.
+// 2026-05-25 v7: FINAL CALIBRATION
+//   POS_RATE=250 → -1.5s drift / 60s
+//   POS_RATE=256 → -0.5s drift / 60s
+//   POS_RATE=258 → -0.2s drift / 60s (FLX10 slow)
+//   POS_RATE=260 → +0.2s drift / 60s (FLX10 fast), IDENTICAL at tempo 0/+5/-5
+// Tempo scaling math is correct (drift constant across pitches).
+// Linear fit: firmware ≈ 259.14 → set 259 for near-zero drift.
+PioneerDDJFLX10Screen._POS_RATE = 259.0;   // ticks per second
+
+// SCREEN MODE — pivot 2026-05-24. 'serato' uses xx 27 (legacy, drift issue).
+// 'rekordbox' uses xx 21 + xx 3D heartbeat. 'vdj' uses xx 21 (different play
+// values: 04 vs rekordbox 00) + no heartbeat. Keep this in sync with the
+// matching flag in Pioneer-DDJ-FLX10-scripts.js (PioneerDDJFLX10._SCREEN_MODE).
+PioneerDDJFLX10Screen._SCREEN_MODE = 'serato';
+
+// (Serato-mode only) A/B flag: when false, position bytes [5..7] are zero
+// (firmware uses our [9..12] time bytes directly → accurate time, static wave);
+// when true, position bytes encode elapsed×POS_RATE BE24 (wave scrolls but
+// firmware re-derives time from position at 0.5x rate → drift).
+// Default false: user explicitly prefers time accuracy over wave scroll
+// ("I cant be having ANY drifting"). The firmware coupling between needle
+// position and time display can't be broken in Serato mode (see history).
+PioneerDDJFLX10Screen._SEND_POSITION = true;
+
+// 2026-05-25: BPM-zero test confirmed firmware does NOT use our BPM bytes
+// for drift formula (uses internal BPM somehow). Reverting to sending real BPM.
+PioneerDDJFLX10Screen._ZERO_BPM_FOR_DRIFT_TEST = false;
 
 PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
     var p = this._zeros();
     p[0]  = deckByte;
     p[1]  = 0x27;
     p[2]  = 0xb4;
-    p[3]  = 0x80;
     p[4]  = 0x01;
     p[20] = 0x0e;
     p[25] = 0x80;
     p[30] = 0x0d;
     p[31] = this._STATE_BYTE_31[deckByte];
-    // Trailer e0 01 00 verified from steady-playback Serato capture
-    // (NOT ff ff ff which was from paused-state captures).
+    // Mode-flag bytes (3, 19, 29, 32-34) are set CONDITIONALLY inside the
+    // trackLoaded block based on whether Mixxx has a beat grid for the track
+    // (proxy: file_bpm > 0).
+    //   - Beat-grid present  → theparade mode (b3=88 b19=07 b29=8c trailer=ad/05/00)
+    //   - Beat-grid absent   → older Serato mode (b3=80 b19=00 b29=92 trailer=e0/01/00)
+    // For empty/unloaded decks, use the simpler default below.
+    p[3]  = 0x80;
+    p[19] = 0x00;
     p[32] = 0xe0;
     p[33] = 0x01;
     p[34] = 0x00;
     if (trackLoaded) {
         var deckNum = this._deckFromDeckByte(deckByte);
         var group   = "[Channel" + deckNum + "]";
-        var pos      = engine.getValue(group, "playposition");
+        // 2026-05-25 DIAGNOSTIC: log + use BOTH playposition COs to test which.
+        var vp = engine.getValue(group, "visual_playposition");
+        var pp = engine.getValue(group, "playposition");
+        // Use playposition (the throttled but stable one) instead of
+        // visual_playposition for this test. If flash stops, the glitch
+        // was in visual_playposition CO; if flashes persist, cause is
+        // elsewhere (e.g. daemon, firmware, or other byte).
+        var pos = pp;
+        // Log when there's a >0.5 disagreement between the two (indicates a
+        // glitch where one is at 0 and the other has the real value).
+        if (Math.abs(vp - pp) > 0.5) {
+            console.log("FLX10 POS_GLITCH deck=" + deckNum + " vp=" + vp + " pp=" + pp);
+        }
         var duration = engine.getValue(group, "duration");
         var fileBpm  = engine.getValue(group, "file_bpm");
         var rateRatio = engine.getValue(group, "rate_ratio");
         var liveBpm  = fileBpm * rateRatio;
 
-        // Static loaded markers (verified from Serato capture)
-        p[29] = 0x92;
+        // 2026-05-26 CAMELOT KEY ENCODING — byte 29.
+        // CORRECTED mapping after empirical test with real Mixxx tracks:
+        //   Odd  values 0x81,0x83,...,0x97 → B-side (major) Camelot
+        //   Even values 0x80,0x82,...,0x96 → A-side (minor) Camelot
+        // (The b29 sweep test had A/B transposed in user's notes — verified
+        //  against minor tracks displaying B-side when we sent odd bytes.)
+        // Camelot number cycle: 8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1 (circle of fifths).
+        // Maps to Mixxx's file_key CO enum (1-24: 1-12=major, 13-24=minor chromatic).
+        //
+        // Mode bytes use theparade set (b3=88, b19=07, trailer=ad/05/00) since
+        // the sweep was performed in that context. Could differ in other modes.
+        p[3]  = 0x88;
+        p[19] = 0x07;
+        p[32] = 0xad;  p[33] = 0x05;  p[34] = 0x00;
+        // 2026-05-26 v2 — corrected after live track test. The original sweep
+        // was off by one Camelot position; rebuilt from direct (file_key,
+        // FLX10 display) measurements. Pattern: each +2 byte step advances
+        // the Camelot number by +7 (mod 12), starting from 0x82=8A.
+        // 0x80 displays nothing (firmware treats as "no key" marker).
+        // 1A maps to 0x98 (extrapolated — completes the 12-position cycle).
+        // ODD bytes are inferred as B-side counterparts (not yet directly tested).
+        // 2026-05-26 v3 — finalized after testing both A- and B-side tracks.
+        // Pattern: each +2 byte step advances Camelot number by +7 (mod 12).
+        // A-side (even bytes) cycle starts at 0x82=8A and 0x80 is the "no key"
+        // marker. B-side (odd bytes) cycle starts at 0x81=8B with no skip;
+        // its "no key" marker is at the END (0x99). Two terminal markers,
+        // not one. (Confirmed: 0x8f→9B in Round 4 test; 0x99→nothing.)
+        var MIXXX_KEY_TO_B29 = [
+            0x80,   //  0 invalid / unanalyzed → "no key" display
+            0x81,   //  1 C major     = 8B
+            0x83,   //  2 D♭ major    = 3B
+            0x85,   //  3 D major     = 10B
+            0x87,   //  4 E♭ major    = 5B
+            0x89,   //  5 E major     = 12B
+            0x8b,   //  6 F major     = 7B
+            0x8d,   //  7 F# major    = 2B
+            0x8f,   //  8 G major     = 9B
+            0x91,   //  9 A♭ major    = 4B
+            0x93,   // 10 A major     = 11B
+            0x95,   // 11 B♭ major    = 6B
+            0x97,   // 12 B major     = 1B
+            0x88,   // 13 C minor     = 5A
+            0x8a,   // 14 C# minor    = 12A
+            0x8c,   // 15 D minor     = 7A
+            0x8e,   // 16 E♭ minor    = 2A
+            0x90,   // 17 E minor     = 9A
+            0x92,   // 18 F minor     = 4A
+            0x94,   // 19 F# minor    = 11A
+            0x96,   // 20 G minor     = 6A
+            0x98,   // 21 G# minor    = 1A
+            0x82,   // 22 A minor     = 8A
+            0x84,   // 23 B♭ minor    = 3A
+            0x86    // 24 B minor     = 10A
+        ];
+        var fileKey = engine.getValue(group, "file_key");
+        var keyIdx  = (fileKey | 0);
+        if (keyIdx < 0 || keyIdx > 24) keyIdx = 0;
+        p[29] = MIXXX_KEY_TO_B29[keyIdx];
 
-        // Time bytes: [9]=min, [10]=sec, [11,12] LE16=ms (REAL REMAINING,
-        // recomputed each tick). When position bytes [5..7] are ZERO,
-        // firmware uses these directly — display matches Mixxx exactly.
-        // (When position bytes are non-zero, firmware uses its own counter
-        // derived from position, and time drifts. That's the trade-off:
-        // accurate time OR scrolling wave, not both.)
+        // TEMPO % DISPLAY (decoded 2026-05-24 from tempo-slider capture).
+        // Bytes layout in xx 27:
+        //   [15] = jitter/counter (4-bit value 0..9, seems noise — try 0)
+        //   [16] = LE-low byte of tempo-related 16-bit value
+        //   [17] = LE-high byte
+        // Empirical: at file_bpm=120, [17][16] LE16 ≈ (live_bpm - 120) × 83.
+        // Generalize: encode percentage offset × scale.
+        // tempo_pct = (live_bpm / file_bpm - 1) × 100  (e.g. +2.5 for +2.5%)
+        // scale empirically ≈ 100 (16-bit value = pct × 100, two-decimal precision)
+        // Use rate_ratio directly so tempo % displays even on tracks without
+        // a detected BPM (where fileBpm = 0 would otherwise blank the field).
+        if (rateRatio > 0) {
+            var pctOffset = (rateRatio - 1.0) * 100.0;
+            // Signed 16-bit, scale by 100 to preserve 2 decimal places
+            var tempoEnc = Math.round(pctOffset * 100.0);
+            if (tempoEnc < 0) tempoEnc = 0x10000 + tempoEnc;   // two's complement LE16
+            if (tempoEnc > 0xFFFF) tempoEnc = 0xFFFF;
+            p[15] = 0;                      // jitter byte — fine at 0
+            p[16] =  tempoEnc        & 0xFF;
+            p[17] = (tempoEnc >>  8) & 0xFF;
+        }
+
+        // [9..12] = WALL duration = file_duration / rate_ratio.
+        // FLOOR (truncate) sub-sec to tenths. Math.round in JS rounds X.5 UP
+        // (Math.round(0.5)==1) which would add a 50-100ms bias for any track
+        // whose sub-sec is in the .X50..X99 range. Floor truncates cleanly.
         if (duration > 0) {
-            var pClamped = pos;
-            if (pClamped < 0.0) pClamped = 0.0;
-            if (pClamped > 1.0) pClamped = 1.0;
-            // Subtract fixed offset to match Mixxx UI's audio-latency-adjusted time
-            var remainingSec = duration * (1.0 - pClamped) - this._TIME_OFFSET_SEC;
-            if (remainingSec < 0) remainingSec = 0;
-            var totalMs = Math.round(remainingSec * 1000);
-            var minutes = Math.floor(totalMs / 60000);
-            var remMs   = totalMs % 60000;
-            var seconds = Math.floor(remMs / 1000);
-            var ms      = remMs % 1000;
-            p[9]  = minutes & 0xFF;
-            p[10] = seconds & 0xFF;
-            p[11] = ms & 0xFF;
-            p[12] = (ms >> 8) & 0xFF;
+            var rrForDur = rateRatio > 0 ? rateRatio : 1.0;
+            var wallDurSec = duration / rrForDur;
+            var totalMsDur = Math.floor(wallDurSec * 1000);
+            var minutesD = Math.floor(totalMsDur / 60000);
+            var remMsD   = totalMsDur % 60000;
+            var secondsD = Math.floor(remMsD / 1000);
+            var msD      = Math.floor((remMsD % 1000) / 100) * 100;
+            p[9]  = minutesD & 0xFF;
+            p[10] = secondsD & 0xFF;
+            p[11] = msD & 0xFF;
+            p[12] = (msD >> 8) & 0xFF;
         } else {
             p[9]  = 0x06;  p[10] = 0x1b;  p[11] = 0xfa;  p[12] = 0x01;
         }
 
         // BPM integer + decimal tenths nibble (same reason as time —
         // sending zero bytes makes the FLX10 BPM field blank).
+        // 2026-05-25 TEST: try zeroing BPM bytes to see if firmware drift
+        // formula uses the BPM bytes we send vs internal BPM.
+        // BPM restored — testing BPM=0 confirmed BPM bytes aren't the
+        // cause of 2 Hz jitter. The user's perceived "downbeat" jumps may
+        // be coincidental with the firmware's fixed refresh rate.
         if (liveBpm > 0) {
             p[13] = Math.floor(liveBpm) & 0xFF;
             var frac = liveBpm - Math.floor(liveBpm);
-            p[14] = (Math.round(frac * 10) & 0x0F) << 4;
+            p[14] = (Math.round(frac * 16) & 0x0F) << 4;
         }
 
-        // Position bytes ZERO — REQUIRED for accurate time display.
-        // The firmware uses [5..7] for both wave-scroll AND time computation.
-        // When non-zero, time drifts (firmware derives time from position
-        // via a non-1x rate we haven't decoded). User priority is exact
-        // time, so we leave these zero. Wave shape still renders (daemon's
-        // xx 36 upload), just doesn't scroll.
-        p[5] = 0; p[6] = 0; p[7] = 0;
+        // 2026-05-25 ROOT-CAUSE FIX for "constant fine-grained shimmer":
+        // Bytes [5..7] are read by firmware as a continuous BE24 wave-needle
+        // counter (per protocol decode memory: "Drives wave needle"). The
+        // previous encoding (byte 5 = minutes, byte 6 = sec-in-min, byte 7 =
+        // sub-sec at 1024/sec % 256) caused byte 7 to wrap every 250ms,
+        // making the BE24 drop by ~254 four times per second — visible as a
+        // 4Hz back-2-forward-4 wave-needle vibration. New encoding: BE24 =
+        // floor(elapsed × POS_RATE), POS_RATE=128 (daemon's empirically
+        // determined in-sync rate). Remaining-time display is unaffected
+        // because it's driven by bytes [9..12].
+        if (this._SEND_POSITION && duration > 0) {
+            var pClampedP = pos;
+            if (pClampedP < 0.0) pClampedP = 0.0;
+            if (pClampedP > 1.0) pClampedP = 1.0;
+            var rrForPos = rateRatio > 0 ? rateRatio : 1.0;
+            var fileElapsedSec = duration * pClampedP;
+            var wallElapsedSec = fileElapsedSec / rrForPos;
+
+            // Mixxx's visual_playposition CO updates ~43 Hz (audio buffer rate)
+            // but our timer runs at 200 Hz. Without interpolation, byte 7
+            // stair-steps every 23ms with ~24-unit jumps = visible jitter.
+            // With interpolation: linear forward extrapolation between Mixxx
+            // updates. NO snap-back: clamp interpolation to NEVER decrease
+            // and only reset base on big pos jumps (seek > 100ms).
+            var nowMs = Date.now();
+            if (this._lastPos[deckNum] === undefined ||
+                Math.abs(pos - this._lastPos[deckNum]) > 0.005) {
+                // Track loaded / seek: reset interpolation base
+                this._lastPos[deckNum]     = pos;
+                this._lastPosTime[deckNum] = nowMs;
+                this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
+            } else if (pos !== this._lastPos[deckNum]) {
+                // Normal forward update from Mixxx. Two cases:
+                // (a) Real pos catches up to or passes our extrapolation → sync.
+                // (b) Real pos is still BEHIND our extrapolation (we've been
+                //     running ahead) → DON'T reset base/time; just track pos.
+                //     If we reset lastPosTime here, next tick computes
+                //     smoothMs = oldBase + ~0, which is LESS than what we
+                //     just sent on the previous tick — visible as a -N+M
+                //     jitter (the user-reported "-2 ticks then +4").
+                this._lastPos[deckNum] = pos;
+                var newBase = wallElapsedSec * 1000;
+                var currentSmooth = this._lastSmoothMs[deckNum] +
+                                    (nowMs - this._lastPosTime[deckNum]);
+                if (newBase >= currentSmooth) {
+                    this._lastSmoothMs[deckNum] = newBase;
+                    this._lastPosTime[deckNum]  = nowMs;
+                }
+                // else: keep extrapolating from the existing base; the maxMs
+                // clamp below will keep us within 30ms of reality.
+            }
+            var msSince = nowMs - this._lastPosTime[deckNum];
+            var smoothMs = Math.floor(this._lastSmoothMs[deckNum] + msSince);
+            // Clamp to never exceed wallElapsedSec by more than 30ms
+            // (= one audio buffer worth of extrapolation)
+            var maxMs = Math.floor(wallElapsedSec * 1000) + 30;
+            if (smoothMs > maxMs) smoothMs = maxMs;
+            var smoothElapsed = smoothMs / 1000;
+            var smoothSecI    = Math.floor(smoothElapsed);
+            p[5] = Math.floor(smoothSecI / 60) & 0xFF;
+            p[6] = (smoothSecI % 60) & 0xFF;
+            // Byte 7: sub-second counter. Firmware EXPECTS ~1024/sec
+            // (4 wraps per second — Serato-captured) for the time display
+            // to render correctly. 2026-05-25 ATTEMPT: 256/sec (one wrap
+            // per second) eliminates BE24 mid-second dips but past testing
+            // showed it produced a .4,.3,.2,.4 time-display cycle. If THIS
+            // attempt also breaks time, revert to 1024/sec and accept the
+            // shimmer until we find another wave-needle source byte.
+            p[7] = Math.floor((smoothMs % 1000) * 256 / 1000) & 0xFF;
+            // 2026-05-25: byte [21] re-enabled as wave-entry index low byte
+            // (elapsed × 150 fps % 256). Serato ticks this byte at 150/sec
+            // continuously. Hypothesis: this is the firmware's TRUE time
+            // reference and compensates for position-byte drift.
+            // byte [21] = wave-entry counter at exactly 125/sec (Serato rate).
+            // Zeroing it didn't change wave behavior, so restore. Confirmed
+            // not the source of 2 jumps/sec we see.
+            var waveIdx = Math.floor(smoothElapsed * 125);
+            p[21] = waveIdx & 0xFF;
+            // Beat counters per Serato pattern:
+            //   byte 8  = eighth-note counter (0..3, cycles every 2 beats)
+            //   byte 22 = sixteenth-note counter (0..14)
+            //   byte 18 = TEST: held at constant 1. User reports wave flickering
+            //             between current position and position 0 — possibly
+            //             firmware redraws the OVERVIEW wave from start on each
+            //             byte 18 transition. Held constant to test.
+            if (fileBpm > 0) {
+                // 2026-05-25: bytes 8, 18, 22 held at 0 (fixed the 4-beat
+                // wave-content flash — cycling these triggered firmware redraw).
+                p[22] = 0;
+                p[8]  = 0;
+                p[18] = 0;
+            } else {
+                p[22] = 0;
+                p[8]  = 0;
+                p[18] = 0;
+            }
+            // 2026-05-26 BYTE 23 STATIC TEST: hold at 0xFF and compare to the
+            // prior state where byte 23 was 0. Watch for any difference.
+            p[23] = 0xff;
+        } else {
+            p[5] = 0; p[6] = 0; p[7] = 0;
+            p[21] = 0x02;
+            p[22] = 0;
+            p[8]  = 0;
+        }
     } else {
         p[29] = 0x80;
     }
     return p;
+};
+
+
+// ===== REKORDBOX-MODE PACKETS (xx 3D heartbeat + xx 21 deck state) =========
+// Captured from flx10-rekordbox-pause-play-scrub.pcapng (deck 1) + opening
+// capture. Static bytes copied verbatim from the captured "loaded paused"
+// packet; we only update [2] (play/pause), [5] (active flag), [11][12]
+// (position) per Mixxx state.
+
+// Captured byte layout for xx 21 — TWO distinct templates per deck state.
+// Empty-deck (no track loaded): minimal packet, mostly zeros. Decoded from
+// flx10-rekordbox-opening (deck 1, no track), bytes [0..15]:
+//   10 21 00 00 20 01 00 00 80 10 00 00 00 00 00 00
+// Loaded-paused: many more bytes set. Decoded from flx10-rekordbox-pause-play-scrub
+// (deck 1, t=0, loaded paused), bytes [0..63]:
+//   10 21 00 0a 2c 01 00 02 80 b4 00 00 00 02 00 02
+//   26 32 03 00 00 7c 00 03 00 00 00 80 00 00 00 02
+//   00 00 00 00 00 00 00 00 00 00 00 ff ff 00 00 00
+//   00 30 00 00 00 00 00 02 00 00 01 00 85 0d 00 00
+// We MUST send the empty template for non-loaded decks. Sending the loaded
+// template for empty decks tells the firmware "deck loaded but garbage data"
+// and the firmware falls back to a degraded display mode.
+
+PioneerDDJFLX10Screen._XX21_LOADED_HEX = (
+    "10210000" + "2c01" + "0002" + "80b40000" + "0002" + "0002" +
+    "26320300" + "007c0003" + "00000080" + "00000002" +
+    "00000000" + "00000000" + "0000ffff" + "00000000" +
+    "30000000" + "00000200" + "00010085" + "0d000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000"
+);
+
+PioneerDDJFLX10Screen._DECK_BYTE_XX21 = [0x10, 0x20, 0x30, 0x40];
+
+PioneerDDJFLX10Screen._buildXX21 = function(deckNum, trackLoaded) {
+    var p = this._zeros();
+    var deckByte = this._DECK_BYTE_XX21[deckNum - 1];
+
+    if (!trackLoaded) {
+        // EMPTY DECK template — verbatim from rekordbox-opening capture.
+        // 10 21 00 00 20 01 00 00 80 10 00 00 ...zeros
+        p[0] = deckByte;
+        p[1] = 0x21;
+        p[4] = 0x20;
+        p[5] = 0x01;
+        p[8] = 0x80;
+        p[9] = 0x10;
+        return p;
+    }
+
+    // LOADED template — fill from hex, then override dynamic fields.
+    var hex = this._XX21_LOADED_HEX;
+    for (var i = 0; i < 128 && (i*2 + 2) <= hex.length; i++) {
+        p[i] = parseInt(hex.substr(i*2, 2), 16);
+    }
+    p[0] = deckByte;
+
+    var group = "[Channel" + deckNum + "]";
+    var pos      = engine.getValue(group, "playposition");
+    var duration = engine.getValue(group, "duration");
+    var play     = engine.getValue(group, "play");
+    var rateRatio = engine.getValue(group, "rate_ratio");
+    if (!(rateRatio > 0)) rateRatio = 1.0;
+
+    // [2] play/pause toggle: 00 playing, 02 paused
+    p[2] = play > 0 ? 0x00 : 0x02;
+    // [5] active flag: 0x81 when track is loaded
+    p[5] = 0x81;
+
+    // [11..12] BE16 position (rate-adjusted real elapsed seconds)
+    if (duration > 0) {
+        var pClamped = pos;
+        if (pClamped < 0.0) pClamped = 0.0;
+        if (pClamped > 1.0) pClamped = 1.0;
+        var elapsedReal = duration * pClamped / rateRatio;
+        var posBE16 = Math.floor(elapsedReal);
+        if (posBE16 < 0) posBE16 = 0;
+        if (posBE16 > 0xFFFF) posBE16 = 0xFFFF;
+        p[11] = (posBE16 >> 8) & 0xFF;
+        p[12] =  posBE16       & 0xFF;
+    }
+    return p;
+};
+
+// xx 3D heartbeat — rekordbox sends 5-frame rotation (byte[2] cycles 01..05)
+// continuously. Stateless cycle counter increments each tick.
+PioneerDDJFLX10Screen._heartbeatTick = 0;
+PioneerDDJFLX10Screen._sendXX3DHeartbeat = function() {
+    this._heartbeatTick = (this._heartbeatTick % 5) + 1;
+    var p = this._zeros();
+    p[0] = 0x00;
+    p[1] = 0x3d;
+    p[2] = this._heartbeatTick;
+    p[3] = 0x00;
+    p[4] = 0x05;
+    this._send(p);
+};
+
+PioneerDDJFLX10Screen._sendRekordboxState = function() {
+    // 1 heartbeat per tick + 1 xx 21 per loaded deck
+    this._sendXX3DHeartbeat();
+    for (var d = 1; d <= 4; d++) {
+        var duration = engine.getValue("[Channel" + d + "]", "duration");
+        this._lastDuration[d] = duration;
+        var loaded = (duration > 0);
+        this._send(this._buildXX21(d, loaded));
+    }
+};
+
+// ===== VDJ-MODE xx 21 (captured 2026-05-24 from flx10-vdj-* captures) ======
+// Same xx 21 layout as rekordbox but DIFFERENT byte values:
+//   byte [2] = 0x04 playing, 0x02 paused (rekordbox: 00/02)
+// Empty-deck template differs slightly from rekordbox empty.
+// VDJ does NOT send xx 3D heartbeat (verified in init capture).
+
+PioneerDDJFLX10Screen._VDJ_XX21_EMPTY_HEX = (
+    // From flx10-vdj-init capture, deck 1, no track loaded (t=6.406):
+    // 10 21 00 0a 04 01 00 02 00 00 0e 00 00 00 00 00
+    // 00 00 00 00 00 69 60 50 fb 00 00 80 00 00 00 00 ...
+    "10210000" + "0a04" + "0100" + "02000000" + "0e000000" +
+    "00000000" + "00000000" + "00696050" + "fb000080" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000"
+);
+
+PioneerDDJFLX10Screen._VDJ_XX21_LOADED_HEX = (
+    // From flx10-vdj-track-load capture, deck 1, loaded (t=14.006):
+    // 10 21 04 0a 0c 81 00 02 80 b4 0e 00 00 c0 01 05
+    // 24 1a 00 00 00 7c 30 00 00 00 00 80 00 00 00 c0
+    // 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    // 00 70 00 00 00 00 00 c0 01 00 03 1e 0b 0d 00 00
+    "1021040a" + "0c810002" + "80b40e00" + "00c00105" +
+    "241a0000" + "007c3000" + "00000080" + "000000c0" +
+    "01000000" + "00000000" + "00000000" + "00000000" +
+    "00700000" + "000000c0" + "0100031e" + "0b0d0000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000" +
+    "00000000" + "00000000" + "00000000" + "00000000"
+);
+
+PioneerDDJFLX10Screen._buildVDJ_XX21 = function(deckNum, trackLoaded) {
+    var p = this._zeros();
+    var deckByte = this._DECK_BYTE_XX21[deckNum - 1];
+    var hex = trackLoaded ? this._VDJ_XX21_LOADED_HEX : this._VDJ_XX21_EMPTY_HEX;
+    for (var i = 0; i < 128 && (i*2 + 2) <= hex.length; i++) {
+        p[i] = parseInt(hex.substr(i*2, 2), 16);
+    }
+    p[0] = deckByte;
+
+    if (trackLoaded) {
+        var group = "[Channel" + deckNum + "]";
+        var pos      = engine.getValue(group, "playposition");
+        var duration = engine.getValue(group, "duration");
+        var play     = engine.getValue(group, "play");
+        var rateRatio = engine.getValue(group, "rate_ratio");
+        if (!(rateRatio > 0)) rateRatio = 1.0;
+
+        // VDJ play/pause toggle: 04 playing, 02 paused
+        p[2] = play > 0 ? 0x04 : 0x02;
+        // [5] = 0x81 active flag (already in template)
+        // [11..12] BE16 elapsed seconds, rate-adjusted to match Mixxx UI clock
+        if (duration > 0) {
+            var pC = pos; if (pC < 0) pC = 0; if (pC > 1) pC = 1;
+            var elapsedReal = duration * pC / rateRatio;
+            var pos16 = Math.floor(elapsedReal);
+            if (pos16 < 0) pos16 = 0;
+            if (pos16 > 0xFFFF) pos16 = 0xFFFF;
+            p[11] = (pos16 >> 8) & 0xFF;
+            p[12] =  pos16       & 0xFF;
+        }
+    }
+    return p;
+};
+
+PioneerDDJFLX10Screen._sendVDJState = function() {
+    // VDJ has NO xx 3D heartbeat. Just xx 21 per deck.
+    for (var d = 1; d <= 4; d++) {
+        var duration = engine.getValue("[Channel" + d + "]", "duration");
+        this._lastDuration[d] = duration;
+        var loaded = (duration > 0);
+        this._send(this._buildVDJ_XX21(d, loaded));
+    }
 };
 
 // EXPERIMENT FLAG: when true, ALWAYS send xx 27 as track_loaded=false even
@@ -212,9 +626,7 @@ PioneerDDJFLX10Screen._sendStateAllDecks = function() {
         var duration = engine.getValue("[Channel" + d + "]", "duration");
         // CRITICAL: skip xx 27 for unloaded decks. Sending "empty deck"
         // xx 27 packets RESETS the firmware's global display state and
-        // also wastes USB bandwidth/JS time. Daemon's old StatePingThread
-        // had the same skip logic; we kept missing it in screen.js until
-        // the perceived lag forced a closer look.
+        // also wastes USB bandwidth/JS time.
         this._lastDuration[d] = duration;
         if (!(duration > 0)) { continue; }
         if (this._FORCE_STATE_EMPTY_FOR_MIDI_TEXT) { continue; }
@@ -453,14 +865,30 @@ PioneerDDJFLX10Screen._onTrackLoad = function(deck) {
 PioneerDDJFLX10Screen.init = function(id) {
     console.log("FLX10 screen v2.0 (xx 27 only, daemon handles wave): init");
 
-    // We no longer prime xx 30 / xx 39 here — the daemon does that.
-    // Just start the 50 Hz xx 27 state ping (the only HID work this module
-    // does in the new architecture).
-    this._stateTimer = engine.beginTimer(
-        this._STATE_MS,
-        function() { PioneerDDJFLX10Screen._sendStateAllDecks(); },
-        false
-    );
+    // Mixxx 2.7-alpha gives us engine.getPlayer() returning a JavascriptPlayerProxy
+    // with: artist, title, album, key (Camelot text like "3B (D♭)"), genre, year, etc.
+    // plus per-property change signals (keyChanged, titleChanged, etc).
+    // NOT exposed: file path / samples / fileBpm / duration / trackLoaded signal.
+    // So daemon's log-tail + SQL-by-samples-and-bpm still needed for waveform.
+    // We can use player.key for Camelot display once we crack the FLX10 key bytes.
+    PioneerDDJFLX10Screen._hasPlayerProxy = (typeof engine.getPlayer === "function");
+    if (this._hasPlayerProxy) {
+        console.log("FLX10 screen: engine.getPlayer available (Mixxx 2.7-alpha+)");
+    }
+
+    // State timer — dispatch based on _SCREEN_MODE.
+    var modeFn;
+    if (this._SCREEN_MODE === 'vdj') {
+        modeFn = function() { PioneerDDJFLX10Screen._sendVDJState(); };
+        console.log("FLX10 screen: VDJ mode (xx 21, no heartbeat)");
+    } else if (this._SCREEN_MODE === 'rekordbox') {
+        modeFn = function() { PioneerDDJFLX10Screen._sendRekordboxState(); };
+        console.log("FLX10 screen: REKORDBOX mode (xx 21 + xx 3D heartbeat)");
+    } else {
+        modeFn = function() { PioneerDDJFLX10Screen._sendStateAllDecks(); };
+        console.log("FLX10 screen: SERATO mode (xx 27)");
+    }
+    this._stateTimer = engine.beginTimer(this._STATE_MS, modeFn, false);
 
     // Track-load detection only — xx 27 updates come from the timer above
     // (NOT event-driven, because Mixxx throttles makeConnection callbacks
@@ -492,4 +920,15 @@ PioneerDDJFLX10Screen.shutdown = function() {
 };
 
 // ACK packets (xx D8 ...) arrive on EP4 IN; we don't need to act on them.
-PioneerDDJFLX10Screen.incomingData = function(data, length) {};
+PioneerDDJFLX10Screen.incomingData = function(data, length) {
+    // Log first 16 bytes — looking for jog-mode button events from FLX10.
+    try {
+        var hex = '';
+        var n = Math.min(length, 16);
+        for (var i = 0; i < n; i++) {
+            var b = data[i] || 0;
+            hex += (b < 16 ? '0' : '') + b.toString(16) + ' ';
+        }
+        console.log("FLX10_HID_IN len=" + length + " bytes=" + hex);
+    } catch (e) {}
+};

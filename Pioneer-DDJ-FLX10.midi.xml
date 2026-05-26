@@ -4411,6 +4411,26 @@
                     <script-binding/>
                 </options>
             </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.cycleJogDisplayLeft</key>
+                <description>Cycle jog display mode (left side)</description>
+                <status>0x90</status>
+                <midino>0x01</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>PioneerDDJFLX10.cycleJogDisplayRight</key>
+                <description>Cycle jog display mode (right side)</description>
+                <status>0x90</status>
+                <midino>0x09</midino>
+                <options>
+                    <script-binding/>
+                </options>
+            </control>
         </controls>
         <outputs>
             <output>
