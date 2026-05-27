@@ -472,9 +472,8 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
                 p[8]  = 0;
                 p[18] = 0;
             }
-            // 2026-05-26 BYTE 23 STATIC TEST: hold at 0xFF and compare to the
-            // prior state where byte 23 was 0. Watch for any difference.
-            p[23] = 0xff;
+            // Byte 23 stays at 0 (zeros() default). Confirmed always 0 across
+            // 9+ Serato captures (bytes 23, 24, 26, 27, 28 all reserved/unused).
         } else {
             p[5] = 0; p[6] = 0; p[7] = 0;
             p[21] = 0x02;
@@ -692,15 +691,35 @@ PioneerDDJFLX10Screen._sendVDJState = function() {
 PioneerDDJFLX10Screen._FORCE_STATE_EMPTY_FOR_MIDI_TEXT = false;
 
 PioneerDDJFLX10Screen._sendStateAllDecks = function() {
+    // 2026-05-26 TIMER DIAGNOSTIC: log actual Hz once per second.
+    // Compares to nominal 200Hz (from _STATE_MS=5). If actual << nominal,
+    // either Mixxx is clamping the timer or HID send is blocking.
+    var tickStart = Date.now();
+    this._tickStats = this._tickStats || {n: 0, lastReport: tickStart,
+                                            buildMs: 0, sendMs: 0};
+    var s = this._tickStats;
+    s.n++;
+    if (tickStart - s.lastReport >= 1000) {
+        var elapsedMs = tickStart - s.lastReport;
+        var hz = (s.n * 1000.0 / elapsedMs).toFixed(1);
+        var avgBuild = (s.buildMs / s.n).toFixed(2);
+        var avgSend = (s.sendMs / s.n).toFixed(2);
+        console.log("FLX10_TICK_RATE " + hz + " Hz over " + s.n + " ticks " +
+                    "in " + elapsedMs + "ms (avg build=" + avgBuild + "ms send=" + avgSend + "ms)");
+        s.n = 0;  s.lastReport = tickStart;  s.buildMs = 0;  s.sendMs = 0;
+    }
     for (var d = 1; d <= 4; d++) {
         var duration = engine.getValue("[Channel" + d + "]", "duration");
-        // CRITICAL: skip xx 27 for unloaded decks. Sending "empty deck"
-        // xx 27 packets RESETS the firmware's global display state and
-        // also wastes USB bandwidth/JS time.
         this._lastDuration[d] = duration;
         if (!(duration > 0)) { continue; }
         if (this._FORCE_STATE_EMPTY_FOR_MIDI_TEXT) { continue; }
-        this._send(this._buildState(this._DECK_BYTE[d - 1], true));
+        var buildStart = Date.now();
+        var pkt = this._buildState(this._DECK_BYTE[d - 1], true);
+        var afterBuild = Date.now();
+        this._send(pkt);
+        var afterSend = Date.now();
+        s.buildMs += (afterBuild - buildStart);
+        s.sendMs += (afterSend - afterBuild);
     }
 };
 
