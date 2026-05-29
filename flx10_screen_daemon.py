@@ -425,24 +425,32 @@ class RefreshThread(threading.Thread):
     daemon: fast seek response and tight playhead tracking. Both approaches
     hit the same ~2-min waveform reset — that's a firmware-side limit we
     haven't cracked yet."""
-    def __init__(self, ep_out, interval_s=0.127):
+    def __init__(self, ep_out, interval_s=0.125):
         super().__init__(daemon=True)
         self.ep_out   = ep_out
-        self.interval = interval_s   # 2026-05-25 EXPERIMENT: 50 Hz trickle
-                                     # (was 5 Hz). Hypothesis: high-rate xx 36
-                                     # with playhead-tracking offset drives wave
-                                     # scroll INDEPENDENTLY of xx 27 position
-                                     # bytes. If firmware uses xx 36 offset for
-                                     # wave needle (not xx 27), we could get
-                                     # accurate time (xx 27 pos=0) + scrolling
-                                     # wave (high-rate xx 36).
+        self.interval = interval_s   # 2026-05-29: REVERTED to 8 Hz (0.125s)
+                                     # to match Serato's measured xx 36 slow-
+                                     # stream cadence. Forensic audit of macOS
+                                     # captures showed Serato sends xx 36 at
+                                     # mean ~14 Hz (dual cadence: 22ms fast +
+                                     # 125ms slow), with forward-streaming
+                                     # entries (+18-19 per packet) and only
+                                     # 0.4% consecutive same-entry packets.
+                                     # The previous 50 Hz refresh + anchor-at-
+                                     # playhead pattern produced ~80% same-
+                                     # entry packets — likely interpreted by
+                                     # the firmware as "redraw at this entry"
+                                     # and producing the residual wave-content
+                                     # flash. Combined with the entry-dedup
+                                     # below, our wire should now match Serato.
+        self._last_entry = {1: None, 2: None, 3: None, 4: None}
         self._stop    = threading.Event()
 
     def run(self):
-        # Send xx 36 packet at current playhead each tick (NO forward-streaming
-        # cursor — that drifted ahead due to wait() imprecision). The wave
-        # data for the whole track is uploaded at track-load via adaptive
-        # PWV5_FPS that fits the firmware buffer (~24,500 entries).
+        # Send xx 36 packet at current playhead each tick. Dedup repeated
+        # entries (2026-05-29): Serato emits xx 36 only when entry advances,
+        # we now do the same to avoid the "redraw at same entry repeated"
+        # interpretation by the firmware.
         ENTRIES_PER_PKT = 19
         while not self._stop.is_set():
             for d in (1, 2, 3, 4):
@@ -450,17 +458,14 @@ class RefreshThread(threading.Thread):
                 if not (st.loaded and st.pwv5 and st.duration > 0):
                     continue
                 n_entries = len(st.pwv5) // 2
-                # Use interpolated pos: st.pos only updates every ~100ms via
-                # FLX10_POS logs, so reading raw st.pos here makes our high-rate
-                # xx 36 packets repeat the SAME entry until the next Mixxx tick.
-                # That repetition is what caused the "wave content flashes to
-                # track start" artifact — interp_pos() advances smoothly between
-                # Mixxx updates.
                 ipos = interp_pos(st)
                 entry = int(ipos * n_entries)
                 if entry < 0: entry = 0
                 if entry > n_entries - ENTRIES_PER_PKT:
                     entry = max(0, n_entries - ENTRIES_PER_PKT)
+                if entry == self._last_entry[d]:
+                    continue   # dedup: firmware doesn't need repeats
+                self._last_entry[d] = entry
                 send_pkt(self.ep_out,
                          _xx36_packet(DECK_BYTES[d], entry, st.pwv5))
             self._stop.wait(self.interval)
@@ -721,8 +726,16 @@ def _xx36_packet(deck_byte, pos_entries, pwv5_bytes, take=19):
     p = zeros()
     p[0]  = deck_byte
     p[1]  = 0x36
-    p[2]  = 0x01
-    p[4]  = 0x01
+    # 2026-05-29 forensic round 6: macOS Serato uses b2=0x00, b4=0x00 in
+    # ALL xx 36 packets (504 in load + 208 in steady play). We were
+    # sending 0x01 for both — possibly putting the firmware into a
+    # different "chunk update" mode that produced the wave-content flash.
+    # User's timeline observation (flash appeared after the xx 27 byte 8
+    # sub-second fix) is consistent with this: the b8 cycling likely
+    # unlocked a firmware "live deck" mode that's strict about xx 36
+    # header byte values.
+    p[2]  = 0x00
+    p[4]  = 0x00
     p[6]  = 0x13
     p[10] =  pos_entries        & 0xFF
     p[11] = (pos_entries >> 8)  & 0xFF
@@ -782,17 +795,34 @@ def handle_track_load(ep, deck, pwv5, label="", duration_sec=0.0, file_bpm=0.0):
     xx35_entries = int(round(duration_sec * 150))
     send_xx35(ep, deck, n_entries=xx35_entries)
     upload_xx36_waveform(ep, deck, pwv5)
-    # xx 2f beat grid — synthesize EIGHTH-NOTE markers (2 per beat) at
-    # constant BPM. Serato's loading capture shows ~2 records per beat across
-    # all decks (analysis 2026-05-25). Variable-BPM via Mixxx BeatGrid-2.0 TODO.
+    # xx 2f beat grid — DENSE 16ms grid (62.5 Hz, one audio buffer at 48k/768).
+    # 2026-05-29: switched from eighth-note (~250ms at 120 BPM, ~15x sparser
+    # than Serato) to 16ms intervals. Decoded from Serato capture
+    # flx10-serato-tracks_starting-playing.pcapng:
+    #   pkt seq=0x02+ records are at +345 samples each (= 0.0156s @ 22050 Hz
+    #   = ~62.5 Hz audio-buffer rate), with btype cycling 0x03→0x04→0x00→0x02
+    #   in straight chronological order (matches our cycle already).
+    #
+    # Hypothesis: firmware uses the xx 2f grid to interpolate the wave-needle
+    # between sparse xx 27 state pings. Our sparse eighth-note grid gave the
+    # firmware almost nothing, so it fell back to default interpolation —
+    # observable as a "skip" every ~quarter-note. Density may fix this.
+    #
+    # Cost: for a 4-min track that's ~15000 records ÷ 30 per packet = 500 xx 2f
+    # packets at track-load. /dev/hidraw sustains >1000 Hz so this completes
+    # in <0.5s. Compared to Serato (~21 packets in the load capture), this is
+    # 23x more — Serato may stream additional dense packets at playback time
+    # instead of front-loading everything. If load time becomes painful, cap
+    # via _XX2F_DENSE_DURATION_S below.
+    _XX2F_DENSE_INTERVAL_MS = 16.0          # 62.5 Hz, matches Serato
+    _XX2F_DENSE_DURATION_S  = duration_sec  # whole-track for now
     if file_bpm and file_bpm > 0 and duration_sec > 0:
-        eighth_interval_ms = 30000.0 / file_bpm   # 8th note = half-beat
-        n_eighths = int(duration_sec * file_bpm * 2 / 60.0)
-        beat_times_ms = [i * eighth_interval_ms for i in range(n_eighths)]
+        n_records = int(_XX2F_DENSE_DURATION_S * 1000.0 / _XX2F_DENSE_INTERVAL_MS)
+        beat_times_ms = [i * _XX2F_DENSE_INTERVAL_MS for i in range(n_records)]
         n_sent, n_pkts = send_xx2f(ep, deck, beat_times_ms)
-        print(f"[beatgrid] deck {deck}: sent {n_sent} 8th-note markers in "
-              f"{n_pkts} packets (bpm={file_bpm:.2f}, "
-              f"interval={eighth_interval_ms:.2f}ms)")
+        print(f"[beatgrid] deck {deck}: sent {n_sent} 16ms-grid records in "
+              f"{n_pkts} packets ({_XX2F_DENSE_DURATION_S:.1f}s coverage @ "
+              f"{_XX2F_DENSE_INTERVAL_MS:.1f}ms)")
     else:
         print(f"[beatgrid] deck {deck}: skipped (file_bpm={file_bpm}, dur={duration_sec})")
 

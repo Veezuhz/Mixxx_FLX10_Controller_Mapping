@@ -5,6 +5,211 @@
 // ====================================================================
 // CHANGE LOG
 // ====================================================================
+// 2026-05-29 — INTERP v4.1: ADDED PAUSE GUARD on top of v4 forward-only
+// re-anchor. v4 alone broke pause: when Mixxx is paused, the play CO is
+// 0 and pos stops updating, so msSince grew unboundedly until the +500ms
+// runaway clamp fired — making the wave/time visibly tick forward then
+// snap back during pause. v4.1 reads engine.getValue(group, "play")
+// before interp and, when paused, freezes smoothMs at the exact
+// wallElapsedSec*1000 without any extrapolation. Play-state interp logic
+// (forward-only re-anchor + 500ms runaway clamp) unchanged from v4.
+//
+// 2026-05-29 — INTERP v4: FORWARD-ONLY RE-ANCHOR (eliminates the residual
+// ~0.5s wave-flash). Forensic audit found our wire produced 234 backward
+// position-byte jumps per minute (Serato has 0 in 53s). The firmware
+// redraws the wave window on every backward jump. Pattern was:
+//   * ~1 Hz big jumps (~750ms) at b6/second boundaries
+//   * ~4 Hz mid jumps (~250ms) at b8 transitions
+// Combined: ~2 Hz visible flash = user-observed 0.5s interval.
+//
+// Root cause was v3's unconditional `_lastSmoothMs = wallElapsedSec*1000`
+// re-anchor on every Mixxx pos update, plus the +200ms safety clamp.
+// Both could move smoothMs BACKWARD when our 200 Hz extrapolation had
+// overshot Mixxx's 43 Hz ground truth. Each backward move = firmware sees
+// position regress = wave-window redraw.
+//
+// FIX: re-anchor _lastSmoothMs ONLY when Mixxx's wall time has actually
+// advanced past our extrapolation (forward-only update). Otherwise hold
+// extrapolation and let msSince keep growing. Safety clamp raised from
+// +200ms to +500ms so it only fires in pathological runaway (Mixxx stall),
+// not on routine 23ms timing jitter.
+//
+// 2026-05-29 — BYTE 21 FIXED: rate multiplier was wrong, causing a
+// once-per-second-of-file-time wave-flash artifact. Forensic audit
+// across 3 BPMs (124/129/173) showed b21 advances at exactly 1991/1024
+// per sub-second-tick (= 1991/sec of file-position time), wraps every
+// 128.6 ms (~7.78 Hz). BPM-independent → it's positional, not musical.
+//
+// Our old formula `floor(smoothFileMs/6) * (2048/167) & 0xFF` had
+// multiplier 2048/167 = 12.2635 per 6 ms boundary. After 167 boundaries
+// (= 1.002 s of file-time): 167*12.2635 = 2048.0 EXACTLY → b21 = 0.
+// So our b21=0 events landed on a perfectly periodic 1-second grid
+// (pos 1.002s, 2.004s, 3.006s, …). The firmware redraws the wave
+// window on b21=0, so a deterministic flash fired once per second.
+// User reported "I can pause on the flash if I time it correctly" —
+// confirming the deterministic-trigger interpretation.
+//
+// FIX: `p[21] = ((subsecTicks * 1991 / 1024) | 0) & 0xFF` where
+// subsecTicks = sec_int*1024 + sub1024 (same field as b8/b22).
+// 1991/1024 is irrational w.r.t. 256 so b21=0 now lands at scattered
+// sub-second positions — matches Serato's wire pattern (b21=0 events
+// at irregular file-positions, no periodic grid). Same wrap rate
+// (~7.78 Hz), no perceptible flash.
+//
+// 2026-05-29 — BYTE 22 SOLVED: also position-driven, not a sixteenth-note
+// counter. Forensic audit across 6 BPMs (88..173) showed b22 cycles
+// 0→1→…→14→0 at a BPM-INDEPENDENT 1.80 s period (= 15 × 120 ms). The
+// "8 Hz sixteenth-note" interpretation was a coincidence of 124 BPM
+// matching the timer.
+//
+// Formula: b22 = floor(subsec_ticks / 123) % 15
+// where subsec_ticks = (b5*60+b6)*1024 + ((b8&3)<<8) + b7 — the same
+// 10-bit position field used by b5..b8. Each b22 step = 120.12 ms of
+// track-position time. Holds when paused (verified across 3+ s pauses
+// in beat-jump capture). Only primary decks (b31 ∈ {0x01,0x02}) get
+// b22 driven; secondary (b31 ∈ {0x03,0x04}) hold at 0. In our code
+// deckNum ≤ 2 = primary.
+//
+// User-reported residual artifact (wave content briefly flashing back
+// to track-start every beat/half-beat after b8 fix) is the predicted
+// behavior of holding b22=0: firmware interprets it as a frozen
+// position-counter and periodically redraws the visible window from
+// start. This fix should eliminate that artifact.
+//
+// 2026-05-29 — BYTE 18 INVESTIGATED, leave at 0. 6 of 7 captures
+// (including macOS beat-loop) hold b18=0 the entire span. The outlier
+// (parade mid-track) shows b18 ticking phase-locked to b22 cycles but
+// appears tied to a Serato performance event we can't observe from
+// USB. Held at 0; revisit only if a separate artifact appears.
+//
+// 2026-05-29 — BYTE 8 SOLVED: it's the sub-second high bits, not a beat
+// counter. Forensic audit of 9 captures + cross-validation against macOS
+// Serato captures showed the actual encoding:
+//
+//   T (wall-elapsed seconds) = b5*60 + b6 + (b8*256 + b7) / 1024
+//
+// b5 = minutes, b6 = seconds, b7 = sub-second low 8 bits, b8 = sub-second
+// high 2 bits. Zero monotonic violations across 51,477 transitions; the
+// only "violations" on macOS were legitimate loop wraps. The cycle period
+// is exactly 1.000 second of firmware-time, BPM-INDEPENDENT — confirming
+// b8 is positional, not musical.
+//
+// All earlier b8 experiments (cycling 0,1,2,3; rotating the cycle; static
+// values 1/2/3; monotonic 0..255) failed because they treated b8 as a
+// beat phase counter when it's actually a 2-bit sub-second extension.
+// Holding b8 = 0 (our long-standing baseline) made the firmware see only
+// sub-second values 0.000..0.249 every second, then snap forward 3/4 s
+// when b6 advanced — exactly the "1, 2, skip 3, 4" wave pattern AND the
+// "decimal cycles 3, 2, 1" time-display artifact.
+//
+// FIX: in _buildState, compute sub1024 = round(sub * 1024) from the
+// interpolated wall-elapsed seconds and write b8 = sub1024 >> 8 & 3,
+// b7 = sub1024 & 0xff. Removed the 6 ms quantization on b7 (it was a
+// workaround for the wrong encoding) and deleted the _CYCLE_B8 /
+// _CYCLE_B8_OFFSET flags and per-deck beat-phase state.
+//
+// Also decoded from the macOS Serato beat-loop capture (NOT yet
+// implemented — separate change set):
+//   * byte 2 bit 3 = LOOP-ACTIVE flag (0xb4 → 0xbc when looping)
+//   * byte 27 = beat-loop indicator: high nibble = state, low nibble =
+//     beat-in-loop counter (0x10 + N at Nth eighth-note into loop).
+//     This is the byte that produced the cycling blue rectangle when
+//     we accidentally drove it during the dedup-defeat test.
+//   * byte 26 = loop sub-position low byte; (b27<<8 | b26) is a 16-bit
+//     monotonic loop position counter advancing ~1000/sec, freezes on
+//     loop release.
+//   * bytes 23 / 24 / 25 also shift between pre-loop and loop-active
+//     state values — not "reserved" as previously assumed from Windows
+//     steady-play captures.
+//
+// 2026-05-29 — BYTE 8 EXPERIMENTS (skip-beat-3, all SUPERSEDED by above):
+//   * User-reported symptom: wave moves past stationary playhead with a
+//     clear "shows beats 1, 2, [skips 3], 4" pattern per bar, plus a
+//     "decimal value of duration cycles 3, 2, 1, 3, 2, 1" — both bar-
+//     aligned, no tempo dependence.
+//   * Diagnosis: byte 8 held at 0 (our 2026-05-25 workaround for an
+//     earlier wave-flash artifact) starves the firmware's eighth-note
+//     phase counter. Serato cycles byte 8 0→1→2→3 at half-beat rate
+//     (audit-verified 4 Hz at 120 BPM).
+//   * v1 (beat-aligned 4-cycle): read Mixxx beat_distance, cycled byte 8
+//     through 0..3 in sync with actual beats. User test: wave-flash
+//     reduced vs the old unaligned cycling, but didn't disappear — the
+//     3→0 wrap on byte 8 was still misaligned vs firmware's expectation
+//     of which exact beat is "the downbeat".
+//   * v2 (monotonic, REVERTED): byte 8 incremented full 8-bit, wraps at
+//     256. User test result: WAVE FROZE COMPLETELY. NEW PROTOCOL FACT —
+//     byte 8 is firmware-validated to the 0..3 range; out-of-range values
+//     are treated as "stop animating". So the 4-cycle is mandatory and
+//     we can't escape the downbeat-wrap signal by widening it.
+//   * v3 (current, Serato-rotation-matched): audit of Serato's actual
+//     byte 8 sequence (theparade-steady-play, 198 transitions) shows the
+//     cycle order is 1→2→3→0→1→…, NOT 0→1→2→3. Same value set, rotated
+//     by one. v1 was off by exactly that rotation, which is consistent
+//     with the residual wave-flash (firmware downbeat marker = 0x00 was
+//     being delivered at the wrong musical moment). v3 adds +1 to the
+//     output: when _beatPhase=0 and halfBeat=0 we now emit byte 8 = 1
+//     instead of 0. byte 8 = 0 is reserved for the actual downbeat,
+//     matching Serato's behavior.
+//   * Bonus protocol-timing find: Serato's 0x03 → 0x00 transition is
+//     ~25 ms earlier than the other three transitions (~230 ms vs
+//     ~255 ms inter-transition gap). 0x00 appears slightly ahead of
+//     the strict half-beat boundary — consistent with downbeat-marker
+//     semantics. Not yet implemented; left for follow-up if needed.
+//   * _CYCLE_B8 flag still controls all of this. Set false to revert to
+//     held-at-0 baseline (skip-beat-3 returns).
+//
+// 2026-05-28 — xx 3D HEARTBEAT EXPERIMENT (Serato mode dedup defeat):
+//   * Cross-protocol audit revealed Rekordbox sends a global xx 3D
+//     heartbeat at ~404 Hz with byte 2 cycling 1→2→3→4→5 every packet
+//     (100% bit-different from predecessor). Pioneer's own dedup-immune
+//     timing pulse.
+//   * Mixxx HidIoOutputReport cache is keyed per-report-id, but FLX10
+//     declares NO report ids → all output reports share one cache slot.
+//     Single-deck testing means consecutive xx 27 holds are bit-identical
+//     and get deduped before hidraw. Interleaving xx 3D (always unique)
+//     breaks the chain: cache holds xx 3D when next xx 27 arrives →
+//     compare fails → every xx 27 hold reaches the wire.
+//   * Added _SERATO_SEND_HEARTBEAT flag (default true). When on,
+//     _sendStateAllDecks calls _sendXX3DHeartbeat() once per tick before
+//     the deck loop. Function already existed (used by rekordbox mode).
+//   * UNTESTED whether Serato-mode firmware accepts xx 3D — could be
+//     silently ignored (best case, dedup defeated), or could glitch the
+//     display, or worse. Flip the flag to false for single-toggle revert.
+//
+// 2026-05-27 (smoothness deep-dive session):
+//   * Wave-needle ticking gap vs Serato traced to Mixxx's HID dedup,
+//     NOT to our protocol encoding. Bytes 21, 7 already quantized to
+//     6ms boundaries (matching Serato's 167 Hz audio-buffer cadence),
+//     so when our boundary holds tick-over-tick the packet is bit-
+//     identical to the previous one — Mixxx's HidIoOutputReport cache
+//     drops it before hidraw sees it. Result: wire stream has ~3%
+//     delta-24 (double-jump after a deduped hold) instead of Serato's
+//     ~18% explicit delta-0 holds.
+//   * Cycle-a-byte fix attempted, then RULED OUT (see audit below).
+//     Byte 27 produced a cycling blue beat-loop rectangle. Byte 64 was
+//     visually clean but user reported MORE jitter — firmware appears
+//     to read padding bytes silently as part of its packet-cadence
+//     clock. Per-byte audit across 4 Serato steady-play captures
+//     (theparade / 4-decks / tracks-starting / play-middle-end): the
+//     ONLY bytes that vary during steady play are 5, 6, 7, 8, 18, 21,
+//     22 — every other byte is a single constant. No firmware-blessed
+//     spare byte exists.
+//   * Only viable dedup-defeat paths remaining: patch Mixxx
+//     HidIoOutputReport for our VID/PID, OR move xx 27 to the Python
+//     daemon (already proven to sustain 1000+ Hz via direct hidraw).
+//     See memory:flx10-mixxx-hid-dedup.
+//   * Byte 21 quantization (v4, earlier this session): file-time
+//     floor(smoothFileMs/6) → scale by 2048/167. Removed Date.now()
+//     jitter-driven outlier deltas (+6/+8/+16) that were confusing
+//     firmware needle interpolation.
+//   * Byte 7 quantization (v4): smoothMsQ = floor(smoothMs/6)*6 then
+//     standard min/sec/sub-sec encoding. Matches the same audio-buffer
+//     cadence Serato uses for byte 7.
+//   * Interp v3 hard re-anchor: every Mixxx pos update resets
+//     _lastSmoothMs to wallElapsedSec*1000 cleanly. Previous Math.max
+//     guard preserved drift accumulation forever once smoothMs got
+//     ahead of wall (observed 2.3s drift after long playback).
+//
 // 2026-05-26 (late-night session):
 //   * Byte 29 CAMELOT KEY encoding cracked. Full 24-key lookup table
 //     wired to Mixxx's file_key CO. First DJ controller in Mixxx to
@@ -124,9 +329,15 @@ PioneerDDJFLX10Screen._getCachedTimeBytes = function(deckNum, pos, duration) {
 };
 PioneerDDJFLX10Screen._WAVE_DURATION = 30;     // seconds of test-pattern waveform
 PioneerDDJFLX10Screen._lastDuration  = {1: 0, 2: 0, 3: 0, 4: 0};
-PioneerDDJFLX10Screen._lastPos       = {};
-PioneerDDJFLX10Screen._lastPosTime   = {1: 0, 2: 0, 3: 0, 4: 0};
-PioneerDDJFLX10Screen._lastSmoothMs  = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._lastPos        = {};
+PioneerDDJFLX10Screen._lastPosTime    = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._lastSmoothMs   = {1: 0, 2: 0, 3: 0, 4: 0};
+// 2026-05-29 v4.2: wall time of the LAST Mixxx pos-value-change. Used to
+// detect "scrub-hold" / stall where play=1 but pos hasn't advanced. When
+// pos is held still for >200ms while play=1 (e.g. user touching the wave),
+// our forward-only interp would keep extrapolating smoothMs forward —
+// same visible-movement bug as the pre-v4.1 pause case.
+PioneerDDJFLX10Screen._lastNewPosTime = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10Screen._stateTimer    = null;
 
 
@@ -218,6 +429,44 @@ PioneerDDJFLX10Screen._SEND_POSITION = true;
 // for drift formula (uses internal BPM somehow). Reverting to sending real BPM.
 PioneerDDJFLX10Screen._ZERO_BPM_FOR_DRIFT_TEST = false;
 
+// 2026-05-29 — Idle xx 27 template per macOS Serato audit (deck 1 + deck 2).
+// Serato sends this packet shape for any deck without a loaded track, at
+// ~40 Hz on each idle deck. Distinguished from the loaded packet by:
+//   * bytes 5..15 all zero (no position / time / BPM)
+//   * b16/b17 = per-deck constants (deck 1: 0x38 0x00, deck 2: 0x70 0xff)
+//   * b19 = 0x00 (not 0x07 like loaded)
+//   * b21..b28 = zero (no counter values)
+//   * b25 = 0x80 (constant)
+//   * b29 = 0x80 (no-key marker)
+//   * b30/b31 = 0x0d / per-deck state (0x02 deck1, 0x01 deck2)
+//   * b32/b33/b34 = 0xff 0xff 0xff trailer (NOT 0xad 0x05 0x00)
+// Decks 3/4 idle templates haven't been captured yet — only build for 1/2.
+PioneerDDJFLX10Screen._IDLE_B16_B17 = {1: [0x38, 0x00], 2: [0x70, 0xff]};
+PioneerDDJFLX10Screen._buildIdleState = function(deckNum) {
+    var p = this._zeros();
+    p[0]  = this._DECK_BYTE[deckNum - 1];
+    p[1]  = 0x27;
+    p[2]  = 0xb4;
+    p[3]  = 0x88;
+    p[4]  = 0x01;
+    // b5..b15 all zero
+    var b16b17 = this._IDLE_B16_B17[deckNum];
+    p[16] = b16b17[0];
+    p[17] = b16b17[1];
+    // b18, b19 zero
+    p[20] = 0x0e;
+    // b21..b24 zero
+    p[25] = 0x80;
+    // b26..b28 zero
+    p[29] = 0x80;  // no-key marker
+    p[30] = 0x0d;
+    p[31] = this._STATE_BYTE_31[this._DECK_BYTE[deckNum - 1]];
+    p[32] = 0xff;
+    p[33] = 0xff;
+    p[34] = 0xff;
+    return p;
+};
+
 PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
     var p = this._zeros();
     p[0]  = deckByte;
@@ -271,6 +520,9 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
         //
         // Mode bytes use theparade set (b3=88, b19=07, trailer=ad/05/00) since
         // the sweep was performed in that context. Could differ in other modes.
+        // 2026-05-29: tried switching to macOS Serato steady-play values
+        // (b19=0x00, trailer 0x0f/0x00/0x00) — no flash improvement AND caused
+        // the blue beat-loop rectangle to appear. Reverted.
         p[3]  = 0x88;
         p[19] = 0x07;
         p[32] = 0xad;  p[33] = 0x05;  p[34] = 0x00;
@@ -319,26 +571,27 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
         if (keyIdx < 0 || keyIdx > 24) keyIdx = 0;
         p[29] = MIXXX_KEY_TO_B29[keyIdx];
 
-        // TEMPO % DISPLAY (decoded 2026-05-24 from tempo-slider capture).
-        // Bytes layout in xx 27:
-        //   [15] = jitter/counter (4-bit value 0..9, seems noise — try 0)
-        //   [16] = LE-low byte of tempo-related 16-bit value
-        //   [17] = LE-high byte
-        // Empirical: at file_bpm=120, [17][16] LE16 ≈ (live_bpm - 120) × 83.
-        // Generalize: encode percentage offset × scale.
-        // tempo_pct = (live_bpm / file_bpm - 1) × 100  (e.g. +2.5 for +2.5%)
-        // scale empirically ≈ 100 (16-bit value = pct × 100, two-decimal precision)
-        // Use rate_ratio directly so tempo % displays even on tracks without
-        // a detected BPM (where fileBpm = 0 would otherwise blank the field).
+        // 2026-05-29 v5.2: USER-MEASURED CORRECTION on Priority 5.
+        // v5.1 hybrid sent 0x0038 at 0% slider on deck 1, but the firmware
+        // displayed +0.6% — meaning 0x0038 was Serato's actual tempo value
+        // in those captures (slider was at +0.56%, not exactly 0). So the
+        // per-deck "base" was a measurement artifact, not a firmware-mode
+        // constant. Reverting to pure tempo encoding for correct display.
+        //
+        // The smoothness boost we observed during v5.0/v5.1 was likely from
+        // BYTE 15: macOS Serato sends b15 = 0x01 constant in steady play
+        // (per round-6 forensic audit), we were sending b15 = 0. Setting
+        // b15 = 0x01 may keep the smoothness gain without breaking tempo.
         if (rateRatio > 0) {
             var pctOffset = (rateRatio - 1.0) * 100.0;
-            // Signed 16-bit, scale by 100 to preserve 2 decimal places
             var tempoEnc = Math.round(pctOffset * 100.0);
-            if (tempoEnc < 0) tempoEnc = 0x10000 + tempoEnc;   // two's complement LE16
+            if (tempoEnc < 0) tempoEnc = 0x10000 + tempoEnc;   // two's-comp LE16
             if (tempoEnc > 0xFFFF) tempoEnc = 0xFFFF;
-            p[15] = 0;                      // jitter byte — fine at 0
+            p[15] = 0x01;                   // was 0 — try Serato's value
             p[16] =  tempoEnc        & 0xFF;
             p[17] = (tempoEnc >>  8) & 0xFF;
+        } else {
+            p[15] = 0x01;
         }
 
         // [9..12] = WALL duration = file_duration / rate_ratio.
@@ -391,89 +644,202 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             var rrForPos = rateRatio > 0 ? rateRatio : 1.0;
             var fileElapsedSec = duration * pClampedP;
             var wallElapsedSec = fileElapsedSec / rrForPos;
+            var isPlaying = engine.getValue(group, "play") > 0;
 
             // Mixxx's visual_playposition CO updates ~43 Hz (audio buffer rate)
             // but our timer runs at 200 Hz. Without interpolation, byte 7
             // stair-steps every 23ms with ~24-unit jumps = visible jitter.
             // With interpolation: linear forward extrapolation between Mixxx
-            // updates. NO snap-back: clamp interpolation to NEVER decrease
-            // and only reset base on big pos jumps (seek > 100ms).
+            // updates.
             var nowMs = Date.now();
-            if (this._lastPos[deckNum] === undefined ||
-                Math.abs(pos - this._lastPos[deckNum]) > 0.005) {
-                // Track loaded / seek: reset interpolation base
-                this._lastPos[deckNum]     = pos;
-                this._lastPosTime[deckNum] = nowMs;
+            var smoothMs;
+            if (!isPlaying) {
+                // 2026-05-29 v4.1: when Mixxx is PAUSED, freeze smoothMs at
+                // the exact wall-elapsed value. Without this, msSince grows
+                // unboundedly between Mixxx updates (which don't arrive while
+                // paused), making the wave/time appear to keep moving and
+                // periodically resync via the runaway clamp = visible flash.
+                this._lastPos[deckNum]      = pos;
+                this._lastPosTime[deckNum]  = nowMs;
                 this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
-            } else if (pos !== this._lastPos[deckNum]) {
-                // Normal forward update from Mixxx. Two cases:
-                // (a) Real pos catches up to or passes our extrapolation → sync.
-                // (b) Real pos is still BEHIND our extrapolation (we've been
-                //     running ahead) → DON'T reset base/time; just track pos.
-                //     If we reset lastPosTime here, next tick computes
-                //     smoothMs = oldBase + ~0, which is LESS than what we
-                //     just sent on the previous tick — visible as a -N+M
-                //     jitter (the user-reported "-2 ticks then +4").
-                this._lastPos[deckNum] = pos;
-                var newBase = wallElapsedSec * 1000;
-                var currentSmooth = this._lastSmoothMs[deckNum] +
-                                    (nowMs - this._lastPosTime[deckNum]);
-                if (newBase >= currentSmooth) {
-                    this._lastSmoothMs[deckNum] = newBase;
-                    this._lastPosTime[deckNum]  = nowMs;
+                smoothMs = Math.floor(wallElapsedSec * 1000);
+            } else {
+                // Track wall time of the last actual pos-value-change. Used
+                // for scrub-hold stall detection below.
+                if (this._lastPos[deckNum] === undefined ||
+                    pos !== this._lastPos[deckNum]) {
+                    this._lastNewPosTime[deckNum] = nowMs;
                 }
-                // else: keep extrapolating from the existing base; the maxMs
-                // clamp below will keep us within 30ms of reality.
+                if (this._lastPos[deckNum] === undefined ||
+                    Math.abs(pos - this._lastPos[deckNum]) > 0.005) {
+                    // Track loaded / seek: reset interpolation base
+                    this._lastPos[deckNum]     = pos;
+                    this._lastPosTime[deckNum] = nowMs;
+                    this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
+                } else if (pos !== this._lastPos[deckNum]) {
+                    // 2026-05-29 v4.3 FIX: handle backward pos jumps as
+                    // user seeks (snap immediately) while keeping the v4
+                    // forward-only re-anchor for forward updates. Earlier
+                    // v4 logic refused to update _lastSmoothMs on backward
+                    // pos jumps too — causing the wave/time to keep going
+                    // forward during a backward scrub until the runaway
+                    // clamp fired (~500ms catchup lag). Mixxx's pos doesn't
+                    // jitter backward during normal play (Serato's wire has
+                    // 0 backward jumps in 53s), so any backward Δpos is a
+                    // genuine user seek and should snap.
+                    var posDelta = pos - this._lastPos[deckNum];
+                    this._lastPos[deckNum] = pos;
+                    if (posDelta < 0) {
+                        // Backward = user seek/scrub. Snap to current.
+                        this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
+                        this._lastPosTime[deckNum]  = nowMs;
+                    } else {
+                        // Forward: only re-anchor when wall has actually
+                        // moved past our extrapolation (v4 behavior).
+                        var newWallMs      = wallElapsedSec * 1000;
+                        var extrapolatedMs = this._lastSmoothMs[deckNum] +
+                                             (nowMs - this._lastPosTime[deckNum]);
+                        if (newWallMs > extrapolatedMs) {
+                            this._lastSmoothMs[deckNum] = newWallMs;
+                            this._lastPosTime[deckNum]  = nowMs;
+                        }
+                        // Else: hold extrapolation; msSince keeps growing.
+                    }
+                }
+                var msSince = nowMs - this._lastPosTime[deckNum];
+                smoothMs = Math.floor(this._lastSmoothMs[deckNum] + msSince);
+                // 2026-05-29 v4.2 — SCRUB-HOLD FREEZE. If Mixxx has not sent
+                // a new pos value in 200ms while play=1, treat as a stall
+                // (scrub-touch / wave scratch / Mixxx audio glitch) and snap
+                // smoothMs to wallElapsedSec*1000. Otherwise our forward-only
+                // interp keeps extrapolating and the wave/time visibly drifts
+                // forward — same symptom as pre-v4.1 paused state.
+                if (nowMs - this._lastNewPosTime[deckNum] > 200) {
+                    this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
+                    this._lastPosTime[deckNum]  = nowMs;
+                    smoothMs = Math.floor(wallElapsedSec * 1000);
+                } else {
+                    // Runaway clamp: if extrapolation drifts >500ms past
+                    // wall (e.g. Mixxx stalled mid-play and the scrub-hold
+                    // check missed it), hard-resync forward. Old +200ms-
+                    // every-tick clamp caused periodic backward jumps.
+                    var maxMs = Math.floor(wallElapsedSec * 1000) + 500;
+                    if (smoothMs > maxMs) {
+                        this._lastSmoothMs[deckNum] = wallElapsedSec * 1000;
+                        this._lastPosTime[deckNum]  = nowMs;
+                        smoothMs = Math.floor(wallElapsedSec * 1000);
+                    }
+                }
             }
-            var msSince = nowMs - this._lastPosTime[deckNum];
-            var smoothMs = Math.floor(this._lastSmoothMs[deckNum] + msSince);
-            // Clamp to never exceed wallElapsedSec by more than 30ms
-            // (= one audio buffer worth of extrapolation)
-            var maxMs = Math.floor(wallElapsedSec * 1000) + 30;
-            if (smoothMs > maxMs) smoothMs = maxMs;
-            var smoothElapsed = smoothMs / 1000;
-            var smoothSecI    = Math.floor(smoothElapsed);
-            p[5] = Math.floor(smoothSecI / 60) & 0xFF;
-            p[6] = (smoothSecI % 60) & 0xFF;
-            // Byte 7: sub-second counter. Firmware EXPECTS ~1024/sec
-            // (4 wraps per second — Serato-captured) for the time display
-            // to render correctly. 2026-05-25 ATTEMPT: 256/sec (one wrap
-            // per second) eliminates BE24 mid-second dips but past testing
-            // showed it produced a .4,.3,.2,.4 time-display cycle. If THIS
-            // attempt also breaks time, revert to 1024/sec and accept the
-            // shimmer until we find another wave-needle source byte.
-            p[7] = Math.floor((smoothMs % 1000) * 256 / 1000) & 0xFF;
-            // Byte 21 — wave-entry / play-progress counter. Two key choices:
-            //   (a) FILE-time anchor (not wall-time / smoothElapsed). Tempo
-            //       slider can't shift byte 21 because file-position doesn't
-            //       move when only tempo changes → no "wave swims with tempo".
-            //   (b) Rate 2048/sec: measured Serato active-play rate from
-            //       flx10-serato-theparade-steady-play.pcapng (8 wraps over
-            //       0.987s = 2076/sec). Wraps every 125ms — sub-perceptible.
-            //       Previous 125/sec wrapped every 2.048s → user-visible as
-            //       "smooth for 2 bars then jump 2 bars".
-            var waveIdx = Math.floor(fileElapsedSec * 2048);
-            p[21] = waveIdx & 0xFF;
-            // Beat counters per Serato pattern:
-            //   byte 8  = eighth-note counter (0..3, cycles every 2 beats)
-            //   byte 22 = sixteenth-note counter (0..14)
-            //   byte 18 = TEST: held at constant 1. User reports wave flickering
-            //             between current position and position 0 — possibly
-            //             firmware redraws the OVERVIEW wave from start on each
-            //             byte 18 transition. Held constant to test.
-            if (fileBpm > 0) {
-                // 2026-05-25: bytes 8, 18, 22 held at 0 (fixed the 4-beat
-                // wave-content flash — cycling these triggered firmware redraw).
-                p[22] = 0;
-                p[8]  = 0;
-                p[18] = 0;
+            // 2026-05-29: bytes 5/6/7/8 form a co-encoded position field
+            //   T = b5*60 + b6 + (b8*256 + b7) / 1024
+            // where T is wall-time elapsed seconds. Validated zero-violation
+            // across 51k+ transitions in 9 Windows captures (forensic audit)
+            // and re-validated on macOS Serato (0.15% violations, all due to
+            // legitimate loop wraps). The previous model — b7 free-running
+            // at 256/sec, b8 = "eighth-note counter" — was wrong, and held
+            // b8 at 0 produced the "1, 2, skip 3, 4" wave artifact because
+            // firmware only saw sub-second values 0..0.249 then snapped
+            // forward at every b6 increment. The earlier 6 ms quantization
+            // is no longer needed; b7/b8 co-encoding gives the firmware the
+            // true 10-bit sub-second cleanly.
+            var totalSec = smoothMs / 1000.0;
+            var sec_int  = Math.floor(totalSec);
+            var sub      = totalSec - sec_int;
+            var sub1024  = Math.round(sub * 1024);
+            if (sub1024 > 1023) sub1024 = 1023;
+            p[5] = Math.floor(sec_int / 60) & 0xFF;
+            p[6] = (sec_int % 60) & 0xFF;
+            p[7] = sub1024 & 0xFF;
+            p[8] = (sub1024 >> 8) & 0x03;
+            // Track-position sub-tick count used by bytes 21 and 22.
+            // 1 tick = 1/1024 s of file-position. Same field as p[5..8].
+            var subsecTicks = sec_int * 1024 + sub1024;
+            // 2026-05-29 — Byte 21 = position-driven 8-bit accumulator at
+            // exactly 1991/1024 ticks per sub-second-tick (≈ 1991/sec of
+            // file-position time). BPM-independent, verified to 0.04% across
+            // 3 decks at 124/129/173 BPM.
+            //
+            // OLD implementation used multiplier 2048/167 ≈ 12.2635 per 6ms
+            // boundary, which made b21=0 land at *exactly* pos 1.002s, 2.004s,
+            // 3.006s … — a perfectly periodic 1-second grid. Combined with
+            // the firmware's tendency to redraw the wave window on b21=0,
+            // this produced a visible "flash back to track-start" once per
+            // second of position-time (user could pause exactly on it).
+            //
+            // The 1991/1024 ratio is irrational w.r.t. 256 → b21=0 events
+            // now land at scattered sub-second positions, just like Serato's
+            // capture data. Same wrap rate (~7.78 Hz, ~128.6 ms per wrap)
+            // but no perfectly periodic alignment → no perceptible flash.
+            //
+            // Derived from the same subsec_ticks field as b8/b22 — consistent
+            // position chain. (subsec_ticks * 1991) easily fits in JS's safe
+            // integer range for tracks up to several hours.
+            p[21] = ((subsecTicks * 1991 / 1024) | 0) & 0xFF;
+            // 2026-05-29 — Byte 22 is ALSO position-driven (like b8), not a
+            // sixteenth-note counter. Forensic audit of 6 captures across
+            // BPMs {124, 129, 173, 88, 139, 171}:
+            //   * 100% sequential 0→1→…→14→0 cycle (15-state ring).
+            //   * BPM-INDEPENDENT. Cycle period = 1.80 s of track-position
+            //     time at every BPM (the 8 Hz rate that looked like a
+            //     sixteenth-note at 124 BPM is coincidence).
+            //   * Stops when track-position stops (verified across 3+ sec
+            //     pauses in beat-jump capture: zero b22 changes).
+            //   * Only primary decks (b31 in {0x01, 0x02}) get b22 driven;
+            //     secondary decks (b31 in {0x03, 0x04}) hold b22=0.
+            // Formula: b22 = floor(subsec_ticks / 123) % 15, where
+            //   subsec_ticks = (b5*60 + b6) * 1024 + ((b8 & 3) << 8) + b7
+            // i.e. the same 10-bit-sub-second position field used by b5..b8.
+            // Each b22 step = 123/1024 s = 120.12 ms of track position.
+            //
+            // deckNum 1, 2 → b31 = 0x02, 0x01 (primary in our _STATE_BYTE_31
+            // mapping). deckNum 3, 4 → b31 = 0x04, 0x03 (secondary).
+            if (deckNum <= 2) {
+                p[22] = Math.floor(subsecTicks / 123) % 15;
             } else {
                 p[22] = 0;
-                p[8]  = 0;
-                p[18] = 0;
             }
+            // Byte 18 = leave at 0. 6 of 7 Serato captures (including macOS
+            // beat-loop capture) hold b18=0 the entire span. The one outlier
+            // (parade mid-track) ticks b18 phase-locked to b22 but appears
+            // tied to a Serato performance event we can't observe from USB.
+            p[18] = 0;
+            // 2026-05-29: tried setting b23/b24/b26/b27 to the macOS Serato
+            // constants (0x65/0x13/0x10/0x1a) — even STATIC 0x1a on byte 27
+            // triggered the blue beat-loop rectangle. So 0x1a alone is enough
+            // to activate the loop-visual state machine; the protocol decode's
+            // earlier note "byte 27 = beat-loop indicator (high nibble = state,
+            // low nibble = beat-in-loop counter)" is correct, and the firmware
+            // treats any non-zero b27 as "loop active". macOS Serato's 0x1a
+            // must be paired with other loop-state bytes (b2 bit 3 etc.) to
+            // produce the "loop inactive but in this rest state" appearance.
+            // Reverted all four to 0 (zeros() default) for now.
             // Byte 23 stays at 0 (zeros() default). Confirmed always 0 across
-            // 9+ Serato captures (bytes 23, 24, 26, 27, 28 all reserved/unused).
+            // 9+ Serato captures.
+            //
+            // 2026-05-27 DEDUP-DEFEAT INVESTIGATION RESULT: ruled out.
+            // Hypothesis was that Mixxx's HidIoOutputReport cache was dropping
+            // our 18% hold packets (bit-identical to predecessor) before they
+            // reached hidraw, while Serato sends them through. Plan was to
+            // cycle one "safe" byte every tick so packets are never identical.
+            //
+            // Audit of 4 Serato steady-play captures (theparade /
+            // 4tracksplayingatonce / tracks_starting / play-middle-end) shows
+            // only six bytes EVER vary during steady play: 5, 6, 7, 8, 18, 21,
+            // 22. Every other byte (including 26, 27, 28, 50, 64, 100, …) is
+            // a single constant value. There is NO firmware-blessed
+            // unobserved byte we can cycle.
+            //   * byte 27 → blue beat-loop rectangle (user verified).
+            //   * byte 64 → no visible artifact but user reports MORE jitter,
+            //     suggesting the firmware reads it silently as part of its
+            //     packet-cadence clock.
+            //
+            // The cycling approach is dead. To get Serato-equivalent wire
+            // pattern (167 Hz with explicit holds rather than our ~200 Hz
+            // no-holds stream) we need to bypass Mixxx's dedup directly —
+            // either patch HidIoOutputReport for our VID/PID, or move xx 27
+            // off the Mixxx HID path entirely (into the daemon, like xx 36).
+            // See memory:flx10-mixxx-hid-dedup.
         } else {
             p[5] = 0; p[6] = 0; p[7] = 0;
             p[21] = 0x02;
@@ -690,29 +1056,82 @@ PioneerDDJFLX10Screen._sendVDJState = function() {
 // real encoding for the duration/BPM bytes. See FLX10-SCREEN-PROTOCOL-FINDINGS.md.
 PioneerDDJFLX10Screen._FORCE_STATE_EMPTY_FOR_MIDI_TEXT = false;
 
+// 2026-05-28 — Serato-mode dedup defeat via xx 3D heartbeat (EXPERIMENT).
+// In Rekordbox mode the firmware accepts a global heartbeat packet
+// `00 3d <seq> 00 05 …` at ~404 Hz with byte 2 cycling 1→2→3→4→5 (every
+// packet bit-different from predecessor). Mixxx's HidIoOutputReport cache
+// is keyed per-report-id; FLX10 has no report ids so all output reports
+// share one cache slot. With single-deck testing, consecutive xx 27 holds
+// are bit-identical → cache drops them before hidraw. Interleaving xx 3D
+// breaks the dedup chain: cache holds an xx 3D when the next xx 27 arrives,
+// the compare fails, the xx 27 hold reaches the wire.
+//
+// UNTESTED whether Serato-mode firmware accepts xx 3D. If anything glitches
+// (display, wave, music) — set this flag to false (single-toggle revert).
+// Possible outcomes:
+//   * firmware ignores xx 3D → dedup defeated, smoother wave needle ✓
+//   * display glitch → revert
+//   * worse jitter (firmware reads heartbeat in unexpected way) → revert
+// 2026-05-29 forensic round 6: comparison vs macOS Serato found we were
+// sending xx 3D heartbeats at ~26 Hz in Serato mode, but Serato itself
+// sends ZERO xx 3D in steady play (it's a rekordbox/VDJ-only packet).
+// Combined with the user's timeline observation that the wave-flash
+// appeared right after the b8 sub-second fix (which likely unlocked the
+// firmware's "live deck" mode, making it strict about all incoming
+// packets), the heartbeat is a strong flash-trigger candidate. Disabled.
+PioneerDDJFLX10Screen._SERATO_SEND_HEARTBEAT = false;
+
 PioneerDDJFLX10Screen._sendStateAllDecks = function() {
     // 2026-05-26 TIMER DIAGNOSTIC: log actual Hz once per second.
     // Compares to nominal 200Hz (from _STATE_MS=5). If actual << nominal,
     // either Mixxx is clamping the timer or HID send is blocking.
     var tickStart = Date.now();
     this._tickStats = this._tickStats || {n: 0, lastReport: tickStart,
-                                            buildMs: 0, sendMs: 0};
+                                            buildMs: 0, sendMs: 0,
+                                            lastTick: tickStart,
+                                            maxGap: 0, gapHist: {}};
     var s = this._tickStats;
     s.n++;
+    // Track inter-tick gap
+    var gap = tickStart - s.lastTick;
+    s.lastTick = tickStart;
+    if (gap > s.maxGap) s.maxGap = gap;
+    var gapBucket = (gap <= 0) ? "0" : (gap <= 5 ? "0-5" : gap <= 10 ? "6-10" : gap <= 20 ? "11-20" : gap <= 30 ? "21-30" : ">30");
+    s.gapHist[gapBucket] = (s.gapHist[gapBucket] || 0) + 1;
     if (tickStart - s.lastReport >= 1000) {
         var elapsedMs = tickStart - s.lastReport;
         var hz = (s.n * 1000.0 / elapsedMs).toFixed(1);
         var avgBuild = (s.buildMs / s.n).toFixed(2);
         var avgSend = (s.sendMs / s.n).toFixed(2);
-        console.log("FLX10_TICK_RATE " + hz + " Hz over " + s.n + " ticks " +
-                    "in " + elapsedMs + "ms (avg build=" + avgBuild + "ms send=" + avgSend + "ms)");
+        var histStr = "";
+        var buckets = ["0-5","6-10","11-20","21-30",">30"];
+        for (var i = 0; i < buckets.length; i++) {
+            histStr += " " + buckets[i] + "ms=" + (s.gapHist[buckets[i]] || 0);
+        }
+        console.log("FLX10_TICK_RATE " + hz + " Hz over " + s.n + " ticks in " +
+                    elapsedMs + "ms (avg build=" + avgBuild + "ms send=" + avgSend +
+                    "ms, maxGap=" + s.maxGap + "ms," + histStr + ")");
         s.n = 0;  s.lastReport = tickStart;  s.buildMs = 0;  s.sendMs = 0;
+        s.maxGap = 0;  s.gapHist = {};
+    }
+    // Dedup-defeat: send xx 3D heartbeat once per tick BEFORE the deck loop.
+    // Each heartbeat has byte 2 cycling 1..5 so it's never bit-identical to
+    // its predecessor. With it in the cache, the next xx 27 (even a hold)
+    // necessarily differs from the cache → reaches hidraw. See the comment
+    // on _SERATO_SEND_HEARTBEAT for the full rationale + revert path.
+    if (this._SERATO_SEND_HEARTBEAT) {
+        this._sendXX3DHeartbeat();
     }
     for (var d = 1; d <= 4; d++) {
         var duration = engine.getValue("[Channel" + d + "]", "duration");
         this._lastDuration[d] = duration;
         if (!(duration > 0)) { continue; }
         if (this._FORCE_STATE_EMPTY_FOR_MIDI_TEXT) { continue; }
+        // 2026-05-29 — TRIED sending Serato's idle-deck xx 27 template for
+        // empty decks 1/2. REGRESSION: wave-needle smoothness on the loaded
+        // deck degraded. Flash unchanged. Reverted to skip-empty-decks
+        // behavior. The added packets likely caused firmware processing
+        // contention rather than fixing anything.
         var buildStart = Date.now();
         var pkt = this._buildState(this._DECK_BYTE[d - 1], true);
         var afterBuild = Date.now();
