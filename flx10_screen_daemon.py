@@ -261,6 +261,17 @@ class DeckState:
         self.prev_pos_ts  = 0.0
         self.last_seek_seq = 0    # bumped each time a SEEK is detected (RefreshThread reads)
         self.pwv5       = b""
+        # 2026-05-29 v6 — set True while upload_xx36_waveform() is bulk-filling
+        # the firmware buffer. The RefreshThread MUST skip the deck while this
+        # is set: otherwise the 8 Hz trickle (at the real playhead, e.g. entry
+        # ~449 near track-start) interleaves with the bulk sweep (entry 0..N),
+        # and since the firmware treats the most-recent xx36 counter as the
+        # displayed playhead, the display rapidly snaps start↔sweep — the
+        # "wave flashes one frame to the very start of the track, ~once per
+        # second" the user reported. Verified from the user's own usbmon
+        # capture: a ~700 Hz xx36 burst (16454→31635) interleaved with trickle
+        # packets at entry 449. See git history / FLX10-SCREEN-PROTOCOL notes.
+        self.uploading  = False
 
 DECKS = {1: DeckState(), 2: DeckState(), 3: DeckState(), 4: DeckState()}
 
@@ -451,23 +462,58 @@ class RefreshThread(threading.Thread):
         # entries (2026-05-29): Serato emits xx 36 only when entry advances,
         # we now do the same to avoid the "redraw at same entry repeated"
         # interpretation by the firmware.
-        ENTRIES_PER_PKT = 19
+        # v7 (FLASH FIX) — CONTIGUOUS forward streaming, like Serato.
+        # Steady-play capture proved our xx27 position AND xx36 entry are both
+        # monotone (we never send zero/backward), yet the wave flashes to start
+        # ~1/sec — a firmware redraw. The anomaly vs Serato is xx36 coverage:
+        # ours was ~2.85 Hz, +56/packet (19-entry windows w/ ~37-entry GAPS);
+        # Serato is ~7.3 Hz, +18.5/packet, CONTIGUOUS. The 30 ms cap in
+        # interp_pos() stalled `entry` between sparse log updates. Fix: advance
+        # a contiguous cursor toward a FREE-RUNNING playhead in +19 steps,
+        # covering every entry; snap only on a real seek.
+        ENTRIES_PER_PKT   = 19
+        MAX_PKTS_PER_TICK = 32
+        SEEK_BACK         = 150
+        SEEK_FWD          = 600
         while not self._stop.is_set():
+            now = time.time()
             for d in (1, 2, 3, 4):
                 st = DECKS[d]
                 if not (st.loaded and st.pwv5 and st.duration > 0):
                     continue
+                if st.uploading:
+                    continue   # don't fight the bulk buffer-fill (flash fix v6)
                 n_entries = len(st.pwv5) // 2
-                ipos = interp_pos(st)
-                entry = int(ipos * n_entries)
-                if entry < 0: entry = 0
-                if entry > n_entries - ENTRIES_PER_PKT:
-                    entry = max(0, n_entries - ENTRIES_PER_PKT)
-                if entry == self._last_entry[d]:
-                    continue   # dedup: firmware doesn't need repeats
-                self._last_entry[d] = entry
-                send_pkt(self.ep_out,
-                         _xx36_packet(DECK_BYTES[d], entry, st.pwv5))
+                maxstart  = max(0, n_entries - ENTRIES_PER_PKT)
+                fpos = st.last_pos_val
+                if st.prev_pos_ts > 0:
+                    dtlog = st.last_pos_ts - st.prev_pos_ts
+                    if 0.010 < dtlog < 0.500:
+                        rate = (st.last_pos_val - st.prev_pos_val) / dtlog
+                        if 0.0 <= rate < 0.5:
+                            dt = now - st.last_pos_ts
+                            if dt > 1.0:
+                                dt = 1.0
+                            if dt > 0.0:
+                                fpos = st.last_pos_val + rate * dt
+                if fpos < 0.0: fpos = 0.0
+                if fpos > 1.0: fpos = 1.0
+                target = int(fpos * n_entries)
+                if target > maxstart:
+                    target = maxstart
+                cur = self._last_entry[d]
+                if cur is None or target < cur - SEEK_BACK or target - cur > SEEK_FWD:
+                    cur = target if target >= 0 else 0
+                    send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
+                else:
+                    sent = 0
+                    while cur < target and sent < MAX_PKTS_PER_TICK:
+                        cur = min(cur + ENTRIES_PER_PKT, target)
+                        send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
+                        sent += 1
+                    if sent == 0:
+                        send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
+                self._last_entry[d] = cur
             self._stop.wait(self.interval)
 
     def stop(self):
@@ -500,8 +546,11 @@ def send_xx30(ep, deck, duration_sec=0.0):
         p[7] = seconds & 0xFF
         p[8] = ms & 0xFF
         p[9] = (ms >> 8) & 0xFF
-    for i in (10, 16, 22, 28, 34, 40, 46, 52):
-        p[i] = 0xff
+    # 2026-05-29: removed the 0xff-every-6-bytes pattern at [10,16,22,...].
+    # Byte-level diff vs flx10-serato-loading4tracks shows Serato's xx30 is
+    # ALL 0x00 after byte 9 (10 30 01 00 01 00 <min sec ms ms> 00 00 ...).
+    # Our stray 0xff bytes may have selected a different firmware track-load
+    # mode (candidate cause of the once-per-second sub-second-wrap redraw).
     send_pkt(ep, p)
 
 
@@ -786,15 +835,38 @@ def handle_track_load(ep, deck, pwv5, label="", duration_sec=0.0, file_bpm=0.0):
         return
     DECKS[deck].pwv5 = bytes(pwv5)
     print(f"  deck {deck}: uploading {len(pwv5)} bytes ({len(pwv5)//2} entries) {label} dur={duration_sec:.1f}s")
-    send_xx30(ep, deck, duration_sec=duration_sec)
-    send_xx39(ep, deck)
-    upload_xx33_album_art(ep, deck, get_test_jpeg())
-    # xx 35 entry count = duration × 150, matching Serato's pattern.
-    # (Serato sends true entry count for the track at 150 fps even when wave
-    # data extends past the firmware's display buffer.)
-    xx35_entries = int(round(duration_sec * 150))
-    send_xx35(ep, deck, n_entries=xx35_entries)
-    upload_xx36_waveform(ep, deck, pwv5)
+    # v6: gate the RefreshThread off this deck for the whole bulk-fill so the
+    # 8 Hz trickle can't interleave snap-backs into the sweep (the flash).
+    DECKS[deck].uploading = True
+    try:
+        send_xx30(ep, deck, duration_sec=duration_sec)
+        # xx39 = BLUE KEY-SYNC indicator on the jog screen (confirmed 2026-05-29:
+        # removing it made the blue indicator disappear). Serato was simply not
+        # key-syncing in the loading4tracks capture, hence its absence there.
+        # TODO: drive this from Mixxx's key-sync / keylock state per deck instead
+        # of sending it unconditionally at every track load.
+        send_xx39(ep, deck)
+        upload_xx33_album_art(ep, deck, get_test_jpeg())
+        # xx 35 entry count = duration × 150, matching Serato's pattern.
+        # (Serato sends true entry count for the track at 150 fps even when wave
+        # data extends past the firmware's display buffer.)
+        xx35_entries = int(round(duration_sec * 150))
+        send_xx35(ep, deck, n_entries=xx35_entries)
+        upload_xx36_waveform(ep, deck, pwv5)
+        # The bulk fill leaves the firmware's playhead-counter parked at the
+        # END of the buffer (entry N). Immediately re-park it at the REAL
+        # playhead so the display lands on the current position instead of
+        # the track end, and reset the RefreshThread's dedup memory so its
+        # first post-upload tick is guaranteed to send.
+        st = DECKS[deck]
+        n_entries = len(st.pwv5) // 2
+        ipos = interp_pos(st)
+        park = int(ipos * n_entries)
+        if park < 0: park = 0
+        if park > n_entries - 19: park = max(0, n_entries - 19)
+        send_scroll_update(ep, deck, park, st.pwv5)
+    finally:
+        DECKS[deck].uploading = False
     # xx 2f beat grid — DENSE 16ms grid (62.5 Hz, one audio buffer at 48k/768).
     # 2026-05-29: switched from eighth-note (~250ms at 120 BPM, ~15x sparser
     # than Serato) to 16ms intervals. Decoded from Serato capture
@@ -1128,7 +1200,7 @@ def main():
     print("Sending xx 30 + xx 39 init to all 4 decks …")
     for d in (1, 2, 3, 4):
         send_xx30(ep_out, d)
-        send_xx39(ep_out, d)
+        send_xx39(ep_out, d)   # xx39 = blue key-sync indicator (see handle_track_load TODO)
 
     # xx 27 is handled ENTIRELY by Mixxx's HID screen.js, with zero position
     # bytes [5..7] (so firmware uses [9..12] for accurate time). Wave shape

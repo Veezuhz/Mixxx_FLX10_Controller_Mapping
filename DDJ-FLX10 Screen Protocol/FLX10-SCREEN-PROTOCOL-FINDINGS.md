@@ -1,5 +1,24 @@
 # DDJ-FLX10 Jog Wheel Screen Protocol — Findings & Open Problem
 
+> **2026-05-29 — "FLASH TO START EVERY SECOND" SOLVED.** The xx 27 sub-second
+> field (`b8<<8 | b7`) is **milliseconds (0–999), NOT 1024ths**. We had been
+> encoding `floor(sub × 1024)` → 0–1023. For the last ~23 ms of every second the
+> field was 1000–1023, which the firmware reads as *more than one full second* of
+> sub-second time → it overflows and snaps the wave/time display to the origin
+> for one frame: the once-per-second flash.
+>
+> Forensic proof: in `flx10-serato-longplay.pcapng` the field **maxes at exactly
+> 999 over 66k packets and never reaches 1023**. Fix: encode `floor(sub × 1000)`,
+> capped at 999 (`PioneerDDJFLX10Screen._buildState`, bytes 7/8).
+>
+> This corrects the earlier "÷1024" model below — that model was monotonic-
+> consistent (so it passed the 51k-transition check) but the max-value test
+> (999 vs 1023) disproves it. Symptom cross-checks confirming the millisecond
+> model: `b8=0` made the field max 255 (never overflows → no flash, but jumpy);
+> pausing froze the display at the origin inside the 1000–1023 band (~17.98 s);
+> moving the tempo slider rescaled the field and slid the band off the paused
+> position.
+
 **Status (2026-05-24 — SCROLLING WAVEFORMS, IN-SYNC):** Loading any analyzed track in Mixxx automatically renders its colored waveform on the FLX10 jog wheel; the waveform **scrolls in sync with playback and responds to scrubbing on paused decks**. Pipeline:
 
 1. Mixxx's MIDI script (`Pioneer-DDJ-FLX10-scripts.js`) logs `FLX10_TRACK_LOAD deck=N samples=X file_bpm=Y duration=Z` on track load and `FLX10_POS deck=N pos=0.0234` every 100ms for any loaded deck.

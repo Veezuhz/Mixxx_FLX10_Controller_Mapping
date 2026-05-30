@@ -293,6 +293,17 @@ PioneerDDJFLX10.init = function(id) {
     console.log("Pioneer DDJ-FLX10 PROD - Initialisation");
 
     var initTimeMode = engine.getValue("[Controls]", "ShowDurationRemaining") !== 0 ? 0x7F : 0x00;
+    // 2026-05-29 — MIDI jog-display path is OFF by default. The firmware fuses
+    // the MIDI jog fields (time mode + MIN/SEC, position marker, speed) with the
+    // HID xx27 screen on the SAME display elements. The MIDI time element, once
+    // enabled by the time-mode note, renders the firmware default in remaining
+    // mode (= the FULL TRACK DURATION) and bled through ~once per second as the
+    // "duration flashes to the beginning every second" artifact — persisting
+    // even with the daemon off and even after feeding jogTime live values,
+    // because the HID↔MIDI fusion itself is the cause. HID xx27 (screen.js) is
+    // the sole authoritative source for time/duration/BPM/position. Flip to
+    // true to restore the legacy MIDI jog-display path.
+    PioneerDDJFLX10._MIDI_JOG_DISPLAY = false;
     // Plage de pitch par défaut (±16%)
     for (var i = 1; i <= 4; i++) {
         var grp = "[Channel" + i + "]";
@@ -301,20 +312,20 @@ PioneerDDJFLX10.init = function(id) {
         engine.makeConnection(grp, "vu_meter", PioneerDDJFLX10["LedVuMeterCH" + i]);
         // Force off au démarrage pour éviter LEDs fantômes
         midi.sendShortMsg(0xB0 + (i - 1), 0x02, 0x00);
-        // Jog display: enable visibility, set time mode, then connect data callbacks
-        midi.sendShortMsg(JOG_DISPLAY_NOTE, 0x5C + i, 0x00);
-        midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[i - 1], initTimeMode);
-        engine.makeConnection(grp, "playposition", PioneerDDJFLX10.jogMarker);
-        engine.makeConnection(grp, "bpm",          PioneerDDJFLX10.jogBpm);
-        engine.makeConnection(grp, "rate",         PioneerDDJFLX10.jogSpeed);
-        engine.makeConnection(grp, "duration",     PioneerDDJFLX10.jogDuration);
-        // Seed duration cache so jogTime works immediately at init
+        // Duration cache (no MIDI — used by HID path and, if re-enabled, jogTime).
         PioneerDDJFLX10._trackDuration[i] = engine.getValue(grp, "duration");
-        // Push initial values so displays start at correct state, not hardware defaults
-        PioneerDDJFLX10.jogMarker(engine.getValue(grp, "playposition"), grp, "playposition");
-        PioneerDDJFLX10.jogBpm(engine.getValue(grp, "bpm"), grp, "bpm");
-        PioneerDDJFLX10.jogSpeed(engine.getValue(grp, "rate"), grp, "rate");
-        PioneerDDJFLX10.jogTime(engine.getValue(grp, "playposition"), grp, "playposition");
+        // Legacy MIDI jog-display path — OFF by default (see _MIDI_JOG_DISPLAY).
+        if (PioneerDDJFLX10._MIDI_JOG_DISPLAY) {
+            midi.sendShortMsg(JOG_DISPLAY_NOTE, 0x5C + i, 0x00);
+            midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[i - 1], initTimeMode);
+            engine.makeConnection(grp, "playposition", PioneerDDJFLX10.jogMarker);
+            engine.makeConnection(grp, "playposition", PioneerDDJFLX10.jogTime);
+            engine.makeConnection(grp, "rate",         PioneerDDJFLX10.jogSpeed);
+            engine.makeConnection(grp, "duration",     PioneerDDJFLX10.jogDuration);
+            PioneerDDJFLX10.jogMarker(engine.getValue(grp, "playposition"), grp, "playposition");
+            PioneerDDJFLX10.jogSpeed(engine.getValue(grp, "rate"), grp, "rate");
+            PioneerDDJFLX10.jogTime(engine.getValue(grp, "playposition"), grp, "playposition");
+        }
     }
     // 2026-05-25 DISABLED — this 250ms MIDI CC timer was sending jog-time
     // MIN/SEC to the FLX10 every 4 Hz using THROTTLED playposition. The
@@ -920,9 +931,14 @@ PioneerDDJFLX10.TimeTypeChange = function(channel, control, value, status, group
     var current = engine.getValue("[Controls]", "ShowDurationRemaining");
     var newMode = current === 0 ? 1 : 0;
     engine.setValue("[Controls]", "ShowDurationRemaining", newMode);
-    var hwMode = newMode !== 0 ? 0x7F : 0x00;
-    for (var d = 0; d < 4; d++) {
-        midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[d], hwMode);
+    // Only push the MIDI time-mode note if the legacy MIDI jog-display is on;
+    // otherwise this would re-enable the MIDI time element that fuses with HID
+    // and causes the once-per-second full-duration flash. HID owns the display.
+    if (PioneerDDJFLX10._MIDI_JOG_DISPLAY) {
+        var hwMode = newMode !== 0 ? 0x7F : 0x00;
+        for (var d = 0; d < 4; d++) {
+            midi.sendShortMsg(JOG_DISPLAY_NOTE, _JOG_TIME_MODE[d], hwMode);
+        }
     }
 };
 

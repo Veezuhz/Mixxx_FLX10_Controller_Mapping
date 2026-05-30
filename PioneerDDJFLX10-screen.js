@@ -5,6 +5,20 @@
 // ====================================================================
 // CHANGE LOG
 // ====================================================================
+// 2026-05-29 — *** "FLASH TO START EVERY SECOND" SOLVED ***
+// The xx 27 sub-second field (b8<<8 | b7) is MILLISECONDS (0..999), not
+// 1024ths. We were sending floor(sub*1024) → 0..1023; for the last ~23 ms of
+// each second the field was 1000..1023, which the firmware reads as >1.000 s
+// of sub-second → overflow → one-frame snap to origin = the flash. Proof:
+// flx10-serato-longplay maxes the field at exactly 999 over 66k packets,
+// never 1023. Fix in _buildState: p[7]/p[8] = floor(sub*1000), cap 999.
+// This SUPERSEDES the "÷1024 sub-second" model in the older entries below
+// (that model was monotonic-consistent so it passed the 51k-transition
+// check, but the 999-vs-1023 max disproves it). Cross-checks: b8=0 maxed the
+// field at 255 (no overflow → no flash, but jumpy); pausing froze the display
+// at origin inside the 1000..1023 band (~17.98 s); the tempo slider rescaled
+// the field and slid the band off the paused position.
+//
 // 2026-05-29 — INTERP v4.1: ADDED PAUSE GUARD on top of v4 forward-only
 // re-anchor. v4 alone broke pause: when Mixxx is paused, the play CO is
 // 0 and pos stops updating, so msSince grew unboundedly until the +500ms
@@ -87,6 +101,9 @@
 // Serato captures showed the actual encoding:
 //
 //   T (wall-elapsed seconds) = b5*60 + b6 + (b8*256 + b7) / 1024
+//   ^^^ DENOMINATOR CORRECTED 2026-05-29: it is /1000 (milliseconds), not
+//       /1024. See the top-of-log "FLASH SOLVED" entry. The /1024 below was
+//       wrong but monotonic-consistent, so this check still "passed."
 //
 // b5 = minutes, b6 = seconds, b7 = sub-second low 8 bits, b8 = sub-second
 // high 2 bits. Zero monotonic violations across 51,477 transitions; the
@@ -491,19 +508,10 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
     if (trackLoaded) {
         var deckNum = this._deckFromDeckByte(deckByte);
         var group   = "[Channel" + deckNum + "]";
-        // 2026-05-25 DIAGNOSTIC: log + use BOTH playposition COs to test which.
-        var vp = engine.getValue(group, "visual_playposition");
-        var pp = engine.getValue(group, "playposition");
-        // Use playposition (the throttled but stable one) instead of
-        // visual_playposition for this test. If flash stops, the glitch
-        // was in visual_playposition CO; if flashes persist, cause is
-        // elsewhere (e.g. daemon, firmware, or other byte).
-        var pos = pp;
-        // Log when there's a >0.5 disagreement between the two (indicates a
-        // glitch where one is at 0 and the other has the real value).
-        if (Math.abs(vp - pp) > 0.5) {
-            console.log("FLX10 POS_GLITCH deck=" + deckNum + " vp=" + vp + " pp=" + pp);
-        }
+        // Use playposition (engine-processing position, stable). The flash was
+        // never a CO-choice issue (it was the ms-overflow, now fixed), so the
+        // visual_playposition cross-check and POS_GLITCH logging were removed.
+        var pos = engine.getValue(group, "playposition");
         var duration = engine.getValue(group, "duration");
         var fileBpm  = engine.getValue(group, "file_bpm");
         var rateRatio = engine.getValue(group, "rate_ratio");
@@ -518,11 +526,11 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
         // Camelot number cycle: 8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1 (circle of fifths).
         // Maps to Mixxx's file_key CO enum (1-24: 1-12=major, 13-24=minor chromatic).
         //
-        // Mode bytes use theparade set (b3=88, b19=07, trailer=ad/05/00) since
-        // the sweep was performed in that context. Could differ in other modes.
-        // 2026-05-29: tried switching to macOS Serato steady-play values
-        // (b19=0x00, trailer 0x0f/0x00/0x00) — no flash improvement AND caused
-        // the blue beat-loop rectangle to appear. Reverted.
+        // Display-mode bytes — "theparade" set (b3=88, b19=07, trailer=ad/05/00).
+        // These were briefly switched to the longplay set (80/00/e0/01/00) while
+        // chasing the flash; that was a dead end (the flash was the ms-overflow,
+        // see top-of-file), so reverted to theparade — which keeps the b29
+        // Camelot-key calibration below valid (it was measured in this mode).
         p[3]  = 0x88;
         p[19] = 0x07;
         p[32] = 0xad;  p[33] = 0x05;  p[34] = 0x00;
@@ -746,12 +754,23 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             var totalSec = smoothMs / 1000.0;
             var sec_int  = Math.floor(totalSec);
             var sub      = totalSec - sec_int;
-            var sub1024  = Math.round(sub * 1024);
+            // sub1024 is kept ONLY for the b21/b22 fine counters below, whose
+            // rates were measured against a 1024 base. It is NOT the sub-second
+            // sent to the firmware (see subMs).
+            var sub1024  = Math.floor(sub * 1024);
             if (sub1024 > 1023) sub1024 = 1023;
             p[5] = Math.floor(sec_int / 60) & 0xFF;
             p[6] = (sec_int % 60) & 0xFF;
-            p[7] = sub1024 & 0xFF;
-            p[8] = (sub1024 >> 8) & 0x03;
+            // Sub-second field (b7 low, b8 high 2 bits) = MILLISECONDS, 0..999.
+            // This is the fix for the once-per-second "flash to start": the
+            // firmware reads (b8<<8|b7) as ms and treats >999 as >1 s of
+            // sub-second (overflow → snap to origin). Encoding 1024ths put the
+            // field at 1000..1023 for the last ~23 ms of each second. Cap at
+            // 999. Full root-cause writeup in the top-of-file change log.
+            var subMs = Math.floor(sub * 1000);
+            if (subMs > 999) subMs = 999;
+            p[7] = subMs & 0xFF;
+            p[8] = (subMs >> 8) & 0x03;
             // Track-position sub-tick count used by bytes 21 and 22.
             // 1 tick = 1/1024 s of file-position. Same field as p[5..8].
             var subsecTicks = sec_int * 1024 + sub1024;
@@ -775,7 +794,22 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             // Derived from the same subsec_ticks field as b8/b22 — consistent
             // position chain. (subsec_ticks * 1991) easily fits in JS's safe
             // integer range for tracks up to several hours.
-            p[21] = ((subsecTicks * 1991 / 1024) | 0) & 0xFF;
+            // 2026-05-29 v5 — CORRECTED RATE to 2048/sec (= ×2 of subsecTicks).
+            // Forensic re-audit of flx10-serato-longplay.pcapng (deck 0x10, 66k
+            // xx27 packets, 54,665-sample slope fit) showed Serato's b21 advances
+            // at EXACTLY 2.00000 per tick = 2048/sec — not 1991/1024. The earlier
+            // "1991/1024 avoids the 1-second flash" rationale was a misdiagnosis:
+            // the flash is NOT caused by b21 hitting 0 on a 1-second grid, it's
+            // caused by b21 being OUT OF PHASE with the b6 (seconds) field at each
+            // whole-second boundary. 2048 = 8×256, so a 2048/sec counter returns
+            // to the SAME phase every whole second (8 full wraps), staying
+            // consistent with b6 — the firmware re-anchors the wave window on the
+            // b6 tick and finds no discontinuity → no flash. With 1991/1024 the
+            // per-second advance is 1991 → phase walks 0,199,142,85,28,… (−57/sec),
+            // so every b6 tick the firmware sees a position discontinuity and
+            // redraws the window: the deterministic, BPM-independent "flash one
+            // frame to the beginning, once per second" the user reported.
+            p[21] = (subsecTicks * 2) & 0xFF;
             // 2026-05-29 — Byte 22 is ALSO position-driven (like b8), not a
             // sixteenth-note counter. Forensic audit of 6 captures across
             // BPMs {124, 129, 173, 88, 139, 171}:
@@ -795,7 +829,12 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             // deckNum 1, 2 → b31 = 0x02, 0x01 (primary in our _STATE_BYTE_31
             // mapping). deckNum 3, 4 → b31 = 0x04, 0x03 (secondary).
             if (deckNum <= 2) {
-                p[22] = Math.floor(subsecTicks / 123) % 15;
+                // 2026-05-29 v5 — cycle length re-measured from longplay capture
+                // at 1848 ticks (b22==0 onset spacing, median over the run), i.e.
+                // step = 1848/15 = 123.2 ticks, not 123. Minor (0.16%), not the
+                // flash cause (b22's period is ~1.8s, not 1s), but aligned for
+                // wire fidelity with Serato.
+                p[22] = Math.floor(subsecTicks / 123.2) % 15;
             } else {
                 p[22] = 0;
             }
