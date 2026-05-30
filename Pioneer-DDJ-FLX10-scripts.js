@@ -760,6 +760,15 @@ PioneerDDJFLX10.keySyncToggle = function(channel, control, value, status, group)
     PioneerDDJFLX10._setKeySyncLed(deck, engaged);
 };
 
+// Tap-to-toggle keylock. The FLX10 keylock button (note 0x4A) is momentary
+// (note-on press / note-off release), so we flip keylock on each press. The
+// blue keylock icon is driven by the keylock output binding (also 0x4A), so no
+// LED code is needed here.
+PioneerDDJFLX10.keylockToggle = function(channel, control, value, status, group) {
+    if (value === 0) { return; }   // act on press only; ignore the release
+    engine.setValue(group, "keylock", engine.getValue(group, "keylock") ? 0 : 1);
+};
+
 // ─── Jog wheel display ────────────────────────────────────────────────────────
 // All data is sent to MIDI channel 16 (0xBF for CC, 0x9F for Note On).
 // Protocol sourced from Loui1979 / community reverse-engineering of the FLX10.

@@ -516,6 +516,39 @@ PioneerDDJFLX10Screen._buildIdleState = function(deckNum) {
     return p;
 };
 
+// Tempo-range slot for xx27 byte[4]. The firmware (Serato mode) shows a fixed
+// label per slot: 0 = blank, 1 = ±8, 2 = ±16, 3 = ±50. We map Mixxx's rateRange
+// (the MIDI cycler's 0.06/0.10/0.16/0.20) onto those slots 0-based, i.e.
+// 6%→blank, 10%→±8, 16%→±16, 20%→±50.
+PioneerDDJFLX10Screen._RATE_RANGES = [0.06, 0.10, 0.16, 0.20];
+
+// DEBUG range-probe: when _RANGE_PROBE is true, byte[4] is auto-cycled 1..16
+// (5s each, logged) so we can read off the % the FLX10 shows for every slot.
+// Set false once the firmware's slot table is known.
+PioneerDDJFLX10Screen._RANGE_PROBE     = false;
+PioneerDDJFLX10Screen._rangeProbeVal   = 1;
+PioneerDDJFLX10Screen._rangeProbeTimer = 0;
+PioneerDDJFLX10Screen._startRangeProbe = function() {
+    if (!this._RANGE_PROBE || this._rangeProbeTimer) { return; }
+    var self = this;
+    console.log("FLX10 RANGE PROBE: byte[4] = 1");
+    this._rangeProbeTimer = engine.beginTimer(5000, function() {
+        self._rangeProbeVal = (self._rangeProbeVal % 16) + 1;
+        console.log("FLX10 RANGE PROBE: byte[4] = " + self._rangeProbeVal);
+    });
+};
+PioneerDDJFLX10Screen._rateRangeIndex = function(group) {
+    var rr = engine.getValue(group, "rateRange");
+    if (!(rr > 0)) { return 0; }   // blank
+    var best = 0;
+    var bestDelta = 1e9;
+    for (var i = 0; i < this._RATE_RANGES.length; i++) {
+        var d = Math.abs(rr - this._RATE_RANGES[i]);
+        if (d < bestDelta) { bestDelta = d; best = i; }
+    }
+    return best;   // 0-based slot: 0=blank, 1=±8, 2=±16, 3=±50
+};
+
 PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
     var p = this._zeros();
     p[0]  = deckByte;
@@ -563,7 +596,14 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
         // chasing the flash; that was a dead end (the flash was the ms-overflow,
         // see top-of-file), so reverted to theparade — which keeps the b29
         // Camelot-key calibration below valid (it was measured in this mode).
-        p[3]  = 0x88;
+        // byte[3]: theparade mode base 0x80; bit 0x08 = KEYLOCK indicator (the
+        // blue lock icon on the jog screen). Decoded from a Serato keylock
+        // on/off capture (byte[3] = 0x80 off / 0x88 on). Reflect Mixxx's live
+        // keylock so the screen lock matches.
+        p[3]  = 0x80 | (engine.getValue(group, "keylock") > 0 ? 0x08 : 0x00);
+        p[4]  = this._RANGE_PROBE
+            ? this._rangeProbeVal               // DEBUG: sweep to map firmware slots
+            : this._rateRangeIndex(group);      // tempo-range index → shown %
         p[19] = 0x07;
         p[32] = 0xad;  p[33] = 0x05;  p[34] = 0x00;
         // 2026-05-26 v2 — corrected after live track test. The original sweep
@@ -1481,7 +1521,7 @@ PioneerDDJFLX10Screen._PWV5_FPS = 150;   // Pioneer/Serato canonical fps
 
 // Waveform visual style. "rgb" = Mixxx RGB (low→R, mid→G, high→B). "filtered"
 // = Mixxx Filtered-style 2-tone (bass warms the bar, treble brightens it).
-PioneerDDJFLX10Screen._WAVE_STYLE = "3band";   // "rgb" | "filtered" | "blue" | "3band"
+PioneerDDJFLX10Screen._WAVE_STYLE = "blue";   // "rgb" | "filtered" | "blue" | "3band"
 
 // Pack one waveform bin (band amplitudes 0-255) into a PWV5 LE16 value per the
 // selected style. Height always comes from `all`. (Phase B will scale the band
@@ -1579,8 +1619,9 @@ PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec, entryBytes) 
     }
     this._sendScrollUpdate(deck, park, entryBytes);
 
-    // xx2f dense 16ms beat grid (needle interpolation between xx27 pings).
-    this._sendBeatGrid(deck, durationSec, engine.getValue(group, "bpm"));
+    // xx2f beat grid (real musical beats from Mixxx, or dense interpolation
+    // grid — see _BEATGRID_MODE).
+    this._sendBeatGrid(deck, durationSec);
 
     console.log("FLX10 screen: native waveform queued deck " + deck +
                 " (" + nEntries + " entries, " + this._txQueue.length +
@@ -1808,53 +1849,115 @@ PioneerDDJFLX10Screen._startEqRefresh = function() {
                 self._lastWinCenter[d] = center;
                 self._lastEqRefresh[d] = now;
             }
+            // Live beatgrid: re-send xx2f when the grid is edited in Mixxx. The
+            // grid signature is playhead-independent, so it only changes on an
+            // actual edit (drag / bpm change) — matching Serato's live re-send.
+            var prm = self._beatGridParams(d, engine.getValue(group, "duration"));
+            if (prm && self._beatSig(prm) !== self._lastBeatSig[d]) {
+                self._sendBeatGrid(d, engine.getValue(group, "duration"));
+            }
         }
     });
 };
 
 
-// ===== xx 2f — dense 16ms beat grid (62.5 Hz), used for needle interpolation =
-PioneerDDJFLX10Screen._XX2F_SR        = 22050;
-PioneerDDJFLX10Screen._XX2F_BEAT_TYPE = [0x03, 0x04, 0x00, 0x02];
-PioneerDDJFLX10Screen._XX2F_RECS_PKT  = 30;
-PioneerDDJFLX10Screen._XX2F_MARKER    = [0x80, 0x02, 0x01, 0x00];
-PioneerDDJFLX10Screen._XX2F_INTERVAL_MS = 16.0;
+// ===== xx 2f — musical beatgrid (Serato format, decoded from captures) ======
+// One record per BEAT in a CONTINUOUS byte stream (records straddle packet
+// boundaries): [beat-count LE16] then, per beat, [btype, LE24 position-in-
+// MILLISECONDS]. The stream is chunked into 122-byte payloads at packet bytes
+// 6..127. Header byte[4] = total packet count. btype: beat 0 = 0x01 (track
+// start), then [0x00,0x02,0x03,0x04][i%4] — 0x00 marks the bar downbeat every
+// 4 beats.
+PioneerDDJFLX10Screen._XX2F_PAYLOAD = 122;
+PioneerDDJFLX10Screen._XX2F_BAR     = [0x00, 0x02, 0x03, 0x04];
+PioneerDDJFLX10Screen._XX2F_INTERVAL_MS = 16.0;   // dense-fallback grid only
 
-PioneerDDJFLX10Screen._sendBeatGrid = function(deck, durationSec, bpm) {
-    if (!(bpm > 0) || !(durationSec > 0)) { return; }   // daemon skips too
+// "beats" = real musical beats from Mixxx's beatgrid; "dense" = uniform 16ms
+// interpolation grid (legacy fallback).
+PioneerDDJFLX10Screen._BEATGRID_MODE = "beats";
+
+PioneerDDJFLX10Screen._emitXX2F = function(deck, beatTimesSec, downbeatSec, beatLenSec) {
+    var n = beatTimesSec.length;
+    if (n === 0) { return; }
+    // Build the continuous stream: [countLE16] + per beat [btype, msLE24].
+    // btype: beat 0 = 0x01 (track-start marker); otherwise the bar position
+    // relative to the real downbeat — 0x00 on the downbeat (every 4 beats),
+    // else 0x02/0x03/0x04. So the bar line lands on the actual musical bar-1.
+    var stream = [n & 0xff, (n >> 8) & 0xff];
+    for (var i = 0; i < n; i++) {
+        var bt;
+        if (i === 0) {
+            bt = 0x01;
+        } else {
+            var barIdx = Math.round((beatTimesSec[i] - downbeatSec) / beatLenSec);
+            bt = this._XX2F_BAR[((barIdx % 4) + 4) % 4];
+        }
+        var ms = Math.round(beatTimesSec[i] * 1000) & 0xffffff;
+        stream.push(bt, ms & 0xff, (ms >> 8) & 0xff, (ms >> 16) & 0xff);
+    }
+    // Chunk the stream into 122-byte payloads at packet bytes 6..127.
     var db = this._DECK_BYTE[deck - 1];
-    var nRecords = Math.floor(durationSec * 1000.0 / this._XX2F_INTERVAL_MS);
-    var totalRecs = nRecords + 1;   // + the leading marker record
-    var perPkt = this._XX2F_RECS_PKT;
-    var totalSegs = Math.max(1, Math.ceil(totalRecs / perPkt));
-    var recIdx = 0;
+    var pay = this._XX2F_PAYLOAD;
+    var totalSegs = Math.max(1, Math.ceil(stream.length / pay));
     for (var seg = 0; seg < totalSegs; seg++) {
         var p = this._zeros();
         p[0] = db;
         p[1] = 0x2f;
         p[2] = (seg + 1) & 0xff;
-        p[4] = 0x15;
-        var off = 6;
-        for (var k = 0; k < perPkt && recIdx < totalRecs; k++) {
-            var b0, b1, b2, b3;
-            if (recIdx === 0) {
-                b0 = this._XX2F_MARKER[0]; b1 = this._XX2F_MARKER[1];
-                b2 = this._XX2F_MARKER[2]; b3 = this._XX2F_MARKER[3];
-            } else {
-                var beatIdx = recIdx - 1;
-                var samples = (Math.round(beatIdx * this._XX2F_INTERVAL_MS *
-                    this._XX2F_SR / 1000.0)) & 0xffffff;
-                b0 = this._XX2F_BEAT_TYPE[beatIdx & 0x03];
-                b1 = samples & 0xff;
-                b2 = (samples >> 8) & 0xff;
-                b3 = (samples >> 16) & 0xff;
-            }
-            p[off] = b0; p[off + 1] = b1; p[off + 2] = b2; p[off + 3] = b3;
-            off += 4;
-            recIdx++;
+        p[4] = totalSegs & 0xff;
+        var base = seg * pay;
+        for (var k = 0; k < pay && base + k < stream.length; k++) {
+            p[6 + k] = stream[base + k];
         }
         this._sendRaw(p);
     }
+};
+
+// Beatgrid params from Mixxx's real beatgrid: {beatLenSec, downbeatSec} (exact
+// spacing + true downbeat anchor) via the getBeatInfo fork API, or a fallback
+// from file_bpm + beat_closest (no true downbeat). Playhead-independent, so its
+// signature only changes when the grid is edited.
+PioneerDDJFLX10Screen._lastBeatSig = {1: "", 2: "", 3: "", 4: ""};
+PioneerDDJFLX10Screen._beatGridParams = function(deck, durationSec) {
+    var group = "[Channel" + deck + "]";
+    if (typeof engine.getBeatInfo === "function") {
+        var info = engine.getBeatInfo(group);
+        if (info && info.length >= 2 && info[0] > 0) {
+            return {beatLenSec: info[0], downbeatSec: info[1]};
+        }
+    }
+    var fileBpm = engine.getValue(group, "file_bpm");
+    if (!(fileBpm > 0)) { return null; }
+    var trackSamples = engine.getValue(group, "track_samples");
+    var beatClosest = engine.getValue(group, "beat_closest");
+    if (!(trackSamples > 0) || !(beatClosest > 0)) { return null; }
+    return {
+        beatLenSec: 60.0 / fileBpm,
+        downbeatSec: (beatClosest / trackSamples) * durationSec,
+    };
+};
+PioneerDDJFLX10Screen._beatSig = function(prm) {
+    return prm.beatLenSec.toFixed(5) + ":" + prm.downbeatSec.toFixed(4);
+};
+
+PioneerDDJFLX10Screen._sendBeatGrid = function(deck, durationSec) {
+    if (!(durationSec > 0)) { return; }
+    var prm = this._beatGridParams(deck, durationSec);
+    if (!prm) { this._lastBeatSig[deck] = ""; return; }
+    var beatLenSec = prm.beatLenSec;
+    var downbeatSec = prm.downbeatSec;
+    // First beat >= 0 (grid phase), then every beat to end of track.
+    var firstBeatSec = downbeatSec -
+        Math.floor(downbeatSec / beatLenSec) * beatLenSec;
+    var times = [];
+    for (var t = firstBeatSec; t < durationSec; t += beatLenSec) {
+        if (t >= -1e-6) { times.push(t); }
+    }
+    this._lastBeatSig[deck] = this._beatSig(prm);
+    console.log("FLX10 screen: beatgrid deck " + deck + " beats=" + times.length +
+        " beatLen=" + beatLenSec.toFixed(4) + "s downbeat=" +
+        downbeatSec.toFixed(3) + "s");
+    this._emitXX2F(deck, times, downbeatSec, beatLenSec);
 };
 
 
@@ -1937,6 +2040,7 @@ PioneerDDJFLX10Screen.init = function(id) {
         }
         this._startTrickle();
         if (this._EQ_REACTIVE) { this._startEqRefresh(); }
+        this._startRangeProbe();
     }
 
     // Track-load detection only — xx 27 updates come from the timer above
