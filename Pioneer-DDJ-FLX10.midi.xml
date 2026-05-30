@@ -2,8 +2,8 @@
 <MixxxControllerPreset mixxxVersion="" schemaVersion="1">
     <info>
         <name>DDJ-FLX10 PROD</name>
-        <author>Marc Zischka</author>
-        <description>DDJ-FLX10 mapping v1.0.1 - Compatible Mixxx 2.3.6+ </description>
+        <author>Victor Pineda (Veezuhz)</author>
+        <description>DDJ-FLX10 Native Waveform Mapping </description>
     </info>
     <controller id="DDJ-FLX10">
         <scriptfiles>

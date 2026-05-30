@@ -380,6 +380,21 @@ PioneerDDJFLX10Screen._send = function(pkt) {
     controller.send(pkt, null, 0);
 };
 
+// Bulk track-load upload path. All our packets share HID reportID 0, so the
+// default skipping send() would supersede-and-drop a rapid burst of *different*
+// xx36/xx2f packets. The non-skipping FIFO (4th send() arg = true) preserves
+// them, but it's only 32 deep and overflows (silently drops) if filled faster
+// than hid_write drains (~1000/s). So _sendRaw just ENQUEUES here; the state
+// tick (_sendStateAllDecks) drains the queue into the FIFO within a per-tick
+// budget, after xx27 — never exceeding the drain rate. This gives the daemon's
+// behavior (xx27 always flows; the bulk uses leftover bandwidth) without the
+// daemon's separate hidraw writer.
+PioneerDDJFLX10Screen._txQueue = [];
+
+PioneerDDJFLX10Screen._sendRaw = function(pkt) {
+    this._txQueue.push(pkt);   // drained, budgeted, by the state tick
+};
+
 PioneerDDJFLX10Screen._zeros = function() {
     var p = [];
     for (var i = 0; i < 128; i++) { p[i] = 0; }
@@ -713,7 +728,7 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
                     // user seeks (snap immediately) while keeping the v4
                     // forward-only re-anchor for forward updates. Earlier
                     // v4 logic refused to update _lastSmoothMs on backward
-                    // pos jumps too — causing the wave/time to keep going
+                    // pos jumps too  causing the wave/time to keep going
                     // forward during a backward scrub until the runaway
                     // clamp fired (~500ms catchup lag). Mixxx's pos doesn't
                     // jitter backward during normal play (Serato's wire has
@@ -1144,6 +1159,18 @@ PioneerDDJFLX10Screen._FORCE_STATE_EMPTY_FOR_MIDI_TEXT = false;
 // packets), the heartbeat is a strong flash-trigger candidate. Disabled.
 PioneerDDJFLX10Screen._SERATO_SEND_HEARTBEAT = false;
 
+// Per-deck last-sent xx27 (for the non-skipping-FIFO dedup, since all decks
+// share reportID 0 and can't rely on Mixxx's per-reportID skip).
+PioneerDDJFLX10Screen._lastXX27 = {1: null, 2: null, 3: null, 4: null};
+PioneerDDJFLX10Screen._xx27Changed = function(deck, pkt) {
+    var prev = this._lastXX27[deck];
+    if (!prev || prev.length !== pkt.length) { return true; }
+    for (var i = 0; i < pkt.length; i++) {
+        if (pkt[i] !== prev[i]) { return true; }
+    }
+    return false;
+};
+
 PioneerDDJFLX10Screen._sendStateAllDecks = function() {
     // 2026-05-26 TIMER DIAGNOSTIC: log actual Hz once per second.
     // Compares to nominal 200Hz (from _STATE_MS=5). If actual << nominal,
@@ -1185,25 +1212,60 @@ PioneerDDJFLX10Screen._sendStateAllDecks = function() {
     if (this._SERATO_SEND_HEARTBEAT) {
         this._sendXX3DHeartbeat();
     }
+    // xx27 for every loaded deck, every tick, via the NON-SKIPPING FIFO.
+    // All decks share HID reportID 0, so the default skipping path keeps only
+    // the LAST deck per IO cycle (others superseded → choppy with 2+ decks).
+    // The FIFO preserves each distinct packet, so every deck scrolls
+    // independently at the full tick rate (200Hz). Per-deck dedup means an
+    // idle/paused deck (identical xx27) costs no bandwidth. xx27 is NEVER capped
+    // — 4 decks × 200Hz = 800/s stays under the ~1000/s hidraw drain, so live
+    // play/scrub/loop/reverse-slip on all decks stays smooth.
+    var buildStart = Date.now();
+    var sent = 0;
     for (var d = 1; d <= 4; d++) {
         var duration = engine.getValue("[Channel" + d + "]", "duration");
         this._lastDuration[d] = duration;
         if (!(duration > 0)) { continue; }
         if (this._FORCE_STATE_EMPTY_FOR_MIDI_TEXT) { continue; }
-        // 2026-05-29 — TRIED sending Serato's idle-deck xx 27 template for
-        // empty decks 1/2. REGRESSION: wave-needle smoothness on the loaded
-        // deck degraded. Flash unchanged. Reverted to skip-empty-decks
-        // behavior. The added packets likely caused firmware processing
-        // contention rather than fixing anything.
-        var buildStart = Date.now();
         var pkt = this._buildState(this._DECK_BYTE[d - 1], true);
-        var afterBuild = Date.now();
-        this._send(pkt);
-        var afterSend = Date.now();
-        s.buildMs += (afterBuild - buildStart);
-        s.sendMs += (afterSend - afterBuild);
+        if (this._xx27Changed(d, pkt)) {
+            this._lastXX27[d] = pkt;
+            controller.send(pkt, 0, 0, true);
+            sent++;
+        }
     }
+    var afterBuild = Date.now();
+    // Pace the bulk waveform upload into whatever bandwidth this tick has left.
+    // This is what keeps the 32-slot FIFO from overflowing: total enqueues/tick
+    // are capped at _TICK_BUDGET (≈1000/s), with xx27 taking priority and the
+    // bulk getting the remainder. A fresh load fills in over a few seconds while
+    // other decks keep playing at full rate — no dropped xx27 frames.
+    var hadBulk = this._txQueue.length > 0;
+    while (sent < this._TICK_BUDGET && this._txQueue.length > 0) {
+        controller.send(this._txQueue.shift(), 0, 0, true);
+        sent++;
+    }
+    if (hadBulk && this._txQueue.length === 0) {
+        console.log("FLX10 screen: upload queue drained");
+    }
+    // Then EQ-refresh packets (lower priority than the initial bulk), drained
+    // round-robin across decks so no deck's EQ window starves another's.
+    for (var rstep = 0; rstep < 4 && sent < this._TICK_BUDGET; rstep++) {
+        var rd = ((this._refreshRR + rstep) % 4) + 1;
+        var rq = this._refreshQueue[rd];
+        while (sent < this._TICK_BUDGET && rq.length > 0) {
+            controller.send(rq.shift(), 0, 0, true);
+            sent++;
+        }
+    }
+    this._refreshRR = (this._refreshRR + 1) % 4;
+    var afterSend = Date.now();
+    s.buildMs += (afterBuild - buildStart);
+    s.sendMs += (afterSend - afterBuild);
 };
+// Per-tick HID send budget. _STATE_MS=5ms × 5 = ~1000 reports/s, matching the
+// measured hidraw drain rate. Lower this if FIFO overflows persist.
+PioneerDDJFLX10Screen._TICK_BUDGET = 5;
 
 // Event-driven scheduler: called whenever playposition / rate_ratio changes.
 // Throttles to _SEND_MIN_GAP_MS to avoid flooding Mixxx's HID write queue.
@@ -1218,28 +1280,53 @@ PioneerDDJFLX10Screen._scheduleStateUpdate = function() {
 
 
 // ===== xx 30 — per-deck init (8 enable-flags at [10,16,22,28,34,40,46,52]) =
-PioneerDDJFLX10Screen._sendInit30 = function(deck) {
+PioneerDDJFLX10Screen._sendInit30 = function(deck, durationSec) {
     var p = this._zeros();
     p[0] = this._DECK_BYTE[deck - 1];
     p[1] = 0x30;
     p[2] = 0x01;
     p[4] = 0x01;
-    var flags = [10, 16, 22, 28, 34, 40, 46, 52];
-    for (var i = 0; i < flags.length; i++) { p[flags[i]] = 0xff; }
-    this._send(p);
+    // Track length at [6..9]: min, sec, ms(LE16). No 0xff trailer — matches
+    // Serato (the stray 0xff pattern selected a redraw-prone firmware mode).
+    if (durationSec > 0) {
+        var totalMs = Math.round(durationSec * 1000);
+        var minutes = Math.floor(totalMs / 60000);
+        var remMs   = totalMs % 60000;
+        var seconds = Math.floor(remMs / 1000);
+        var ms      = remMs % 1000;
+        p[6] = minutes & 0xff;
+        p[7] = seconds & 0xff;
+        p[8] = ms & 0xff;
+        p[9] = (ms >> 8) & 0xff;
+    }
+    this._sendRaw(p);
 };
 
 
-// ===== xx 35 — "begin waveform" (3 packets per deck) =======================
-PioneerDDJFLX10Screen._sendInit35 = function(deck) {
+// ===== xx 35 — total waveform entry count (LE16 at [2][3]), 3 packets =======
+PioneerDDJFLX10Screen._sendInit35 = function(deck, nEntries) {
     var db = this._DECK_BYTE[deck - 1];
-    var p1 = this._zeros();
-    p1[0] = db;  p1[1] = 0x35;
-    this._send(p1);
-    for (var i = 0; i < 2; i++) {
+    for (var i = 0; i < 3; i++) {
         var p = this._zeros();
-        p[0] = db;  p[1] = 0x35;  p[2] = 0x0e;  p[3] = 0xe3;
-        this._send(p);
+        p[0] = db;
+        p[1] = 0x35;
+        p[2] = nEntries & 0xff;
+        p[3] = (nEntries >> 8) & 0xff;
+        this._sendRaw(p);
+    }
+};
+
+// ===== xx 39 — HOT CUE display setup (3 fixed packets, deck byte varies) =====
+PioneerDDJFLX10Screen._sendXX39 = function(deck) {
+    var db = this._DECK_BYTE[deck - 1];
+    for (var i = 0; i < this._XX39_HEX.length; i++) {
+        var hex = this._XX39_HEX[i];
+        var p = this._zeros();
+        for (var j = 0; j * 2 < hex.length && j < 128; j++) {
+            p[j] = parseInt(hex.substr(j * 2, 2), 16);
+        }
+        p[0] = db;
+        this._sendRaw(p);
     }
 };
 
@@ -1358,7 +1445,7 @@ PioneerDDJFLX10Screen._uploadAlbumArt = function(deck) {
             for (var k = 0; k < take2; k++) { p[6 + k] = hexAt(pos + k); }
             pos += take2;
         }
-        this._send(p);
+        this._sendRaw(p);
     }
 };
 
@@ -1367,22 +1454,99 @@ PioneerDDJFLX10Screen._uploadAlbumArt = function(deck) {
 // Test pattern: bright solid red, max height across the whole track length.
 // To swap in real Mixxx waveform data: replace _generateEntries with a function
 // that returns LE16 PWV5 bytes derived from the loaded track.
-PioneerDDJFLX10Screen._generateEntries = function(durationSec) {
-    var n = Math.floor(durationSec * 150);
-    var out = [];
-    var r = 7, g = 0, b = 0, h = 31;
-    var v = (r << 13) | (g << 10) | (b << 7) | (h << 2);
-    var lo = v & 0xff;
-    var hi = (v >> 8) & 0xff;
-    for (var i = 0; i < n; i++) { out.push(lo); out.push(hi); }
+// Build PWV5 entry bytes from Mixxx's native in-memory waveform (via the
+// engine.getWaveformSummary API). Returns LE16 bytes per entry, or null if the
+// waveform isn't loaded yet (caller should retry). PWV5 packing: low→R(3b),
+// mid→G(3b), high→B(3b), all→height(5b) → (R<<13|G<<10|B<<7|H<<2).
+PioneerDDJFLX10Screen._generateEntries = function(deck, durationSec) {
+    var n = Math.floor(durationSec * this._PWV5_FPS);
+    if (n <= 0) { return null; }
+    if (typeof engine.getWaveformSummary !== "function") {
+        return null;   // running on a Mixxx without the native API
+    }
+    var wf = engine.getWaveformSummary("[Channel" + deck + "]", n);
+    if (!wf || !wf.length) { return null; }   // not analysed / not loaded yet
+    this._wfBands[deck] = wf;   // raw [all,low,mid,high] cache for the EQ refresh
+    var bins = Math.floor(wf.length / 4);
+    var out = new Array(bins * 2);
+    for (var i = 0; i < bins; i++) {
+        var v = this._packBin(wf[i * 4], wf[i * 4 + 1],
+            wf[i * 4 + 2], wf[i * 4 + 3]);
+        out[i * 2]     = v & 0xff;
+        out[i * 2 + 1] = (v >> 8) & 0xff;
+    }
     return out;
 };
+PioneerDDJFLX10Screen._PWV5_FPS = 150;   // Pioneer/Serato canonical fps
 
-PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec) {
+// Waveform visual style. "rgb" = Mixxx RGB (low→R, mid→G, high→B). "filtered"
+// = Mixxx Filtered-style 2-tone (bass warms the bar, treble brightens it).
+PioneerDDJFLX10Screen._WAVE_STYLE = "3band";   // "rgb" | "filtered" | "blue" | "3band"
+
+// Pack one waveform bin (band amplitudes 0-255) into a PWV5 LE16 value per the
+// selected style. Height always comes from `all`. (Phase B will scale the band
+// amplitudes by the live EQ/filter gains before this is called.)
+PioneerDDJFLX10Screen._packBin = function(all, low, mid, high) {
+    var h = (all * 31 / 255) | 0;
+    if (h > 31) { h = 31; }
+    var r, g, b;
+    if (this._WAVE_STYLE === "blue") {
+        // Pioneer/CDJ "blue" family with clear band separation along a
+        // blue -> cyan -> white ramp:
+        //   low-heavy  -> deep blue (0,0,7)
+        //   mid-heavy  -> cyan      (0,g,7)
+        //   high-heavy -> white     (r,g,7)
+        b = 7;                              // blue body (always lit)
+        g = ((mid + high) * 7 / 255) | 0;   // mids AND treble raise green
+        r = (high * 7 / 255) | 0;           // treble alone adds red -> white tips
+    } else if (this._WAVE_STYLE === "filtered") {
+        var bias = high - low;
+        g = 4 + (bias > 96 ? 1 : (bias < -96 ? -1 : 0));
+        if (g < 2) { g = 2; }
+        if (g > 6) { g = 6; }
+        r = 7;
+        b = 0;
+    } else if (this._WAVE_STYLE === "3band") {
+        // rekordbox-style 3-band. Anchor colors (0..7 space):
+        //   low  -> blue   (0, 0, 7)
+        //   mid  -> orange (7, 3, 0)
+        //   high -> white  (7, 7, 7)
+        // rekordbox stacks these vertically; we get one color per column, so
+        // we amplitude-blend them (ratio = hue, height still carries amplitude).
+        var sum = low + mid + high;
+        if (sum < 1) { sum = 1; }                 // silence guard (div-by-zero)
+        r = ((mid * 7 + high * 7) / sum) | 0;
+        g = ((mid * 3 + high * 7) / sum) | 0;
+        b = ((low * 7 + high * 7) / sum) | 0;
+    } else {
+        // RGB: low -> R, mid -> G, high -> B (Mixxx RGB waveform).
+        r = (low * 7 / 255) | 0;
+        g = (mid * 7 / 255) | 0;
+        b = (high * 7 / 255) | 0;
+    }
+    if (r > 7) { r = 7; }
+    if (g > 7) { g = 7; }
+    if (b > 7) { b = 7; }
+    return (r << 13) | (g << 10) | (b << 7) | (h << 2);
+};
+
+PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec, entryBytes) {
     var db = this._DECK_BYTE[deck - 1];
-    var entryBytes = this._generateEntries(durationSec);
     var nEntries = entryBytes.length / 2;
     var ENTRIES_PER_PKT = 19;
+    var group = "[Channel" + deck + "]";
+    this._entries[deck] = entryBytes;   // cache for the playhead trickle
+
+    // FULL Serato-style track-load sequence — the firmware only arms the
+    // track-loaded display when it receives ALL of these; partial sequences
+    // (xx30/35/36 alone) don't trigger the wave. Mirrors the daemon exactly:
+    //   xx30 (length) → xx39 (hot-cue) → xx33 (album art) → xx35 (count)
+    //   → xx36 (waveform) → xx36 re-park → xx2f (beat grid)
+    this._sendInit30(deck, durationSec);
+    this._sendXX39(deck);
+    this._uploadAlbumArt(deck);
+    // xx35 count = duration × 150 (Serato's pattern), not the clamped entry count.
+    this._sendInit35(deck, Math.round(durationSec * this._PWV5_FPS));
 
     var pos = 0;
     while (pos < nEntries) {
@@ -1390,8 +1554,8 @@ PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec) {
         var p = this._zeros();
         p[0]  = db;
         p[1]  = 0x36;
-        p[2]  = 0x01;     // CONSTANT — not a segment counter
-        p[4]  = 0x01;
+        p[2]  = 0x00;     // match the working daemon (0x01 = wrong chunk mode)
+        p[4]  = 0x00;
         p[6]  = 0x13;
         p[10] =  pos        & 0xff;
         p[11] = (pos >> 8)  & 0xff;
@@ -1400,35 +1564,336 @@ PioneerDDJFLX10Screen._uploadWaveform = function(deck, durationSec) {
         for (var j = 0; j < take * 2; j++) {
             p[14 + j] = entryBytes[pos * 2 + j];
         }
-        this._send(p);
+        this._sendRaw(p);
         pos += take;
+    }
+
+    // Re-park the firmware playhead at the REAL position — the bulk fill leaves
+    // its counter at the track end, so the display would otherwise show the end.
+    var ppos = engine.getValue(group, "playposition");
+    if (!(ppos >= 0)) { ppos = 0; }
+    var park = Math.floor(ppos * nEntries);
+    if (park < 0) { park = 0; }
+    if (park > nEntries - ENTRIES_PER_PKT) {
+        park = Math.max(0, nEntries - ENTRIES_PER_PKT);
+    }
+    this._sendScrollUpdate(deck, park, entryBytes);
+
+    // xx2f dense 16ms beat grid (needle interpolation between xx27 pings).
+    this._sendBeatGrid(deck, durationSec, engine.getValue(group, "bpm"));
+
+    console.log("FLX10 screen: native waveform queued deck " + deck +
+                " (" + nEntries + " entries, " + this._txQueue.length +
+                " packets) — bulk paced into spare bandwidth, budget " +
+                this._TICK_BUDGET + "/tick");
+};
+
+
+// ===== xx 36 re-park — single packet at the current playhead position =======
+// direct=true bypasses the upload queue (used by the low-rate trickle, which
+// must not be stuck behind a bulk upload and is too small to overflow the FIFO).
+PioneerDDJFLX10Screen._sendScrollUpdate = function(deck, posEntries, entryBytes, direct) {
+    if (!entryBytes || posEntries < 0) { return; }
+    var nEntries = entryBytes.length / 2;
+    var take = Math.min(19, nEntries - posEntries);
+    if (take <= 0) { return; }
+    var p = this._zeros();
+    p[0]  = this._DECK_BYTE[deck - 1];
+    p[1]  = 0x36;
+    p[2]  = 0x00;
+    p[4]  = 0x00;
+    p[6]  = 0x13;
+    p[10] =  posEntries        & 0xff;
+    p[11] = (posEntries >> 8)  & 0xff;
+    p[12] = (posEntries >> 16) & 0xff;
+    p[13] = (posEntries >> 24) & 0xff;
+    for (var j = 0; j < take * 2; j++) {
+        p[14 + j] = entryBytes[posEntries * 2 + j];
+    }
+    if (direct) {
+        this._lastSentPkt = p;
+        controller.send(p, 0, 0, true);
+    } else {
+        this._sendRaw(p);
+    }
+};
+
+
+// ===== Playhead trickle — port of the daemon's RefreshThread ================
+// Continuously re-sends one xx36 at the live playhead for each loaded deck.
+// This (a) keeps the firmware from dropping the waveform (~1 min without it),
+// (b) moves the wave needle during playback, and (c) re-asserts the wave so a
+// deck that didn't latch on first upload recovers. Skipped while a bulk upload
+// is draining (queue non-empty) to avoid FIFO contention.
+// Trickle disabled for now: it uses Mixxx's priority (non-skipping) FIFO, which
+// preempts the skipping-path 200Hz xx27 that actually drives the wave scroll →
+// the wave stalls as soon as the bulk drain ends. xx27 alone scrolls the wave
+// (this is what the daemon relied on); the firmware may drop the wave after
+// ~1 min without a refresh, which we'll re-solve with a non-preempting refresh.
+PioneerDDJFLX10Screen._TRICKLE_ENABLE   = false;
+PioneerDDJFLX10Screen._entries          = {1: null, 2: null, 3: null, 4: null};
+PioneerDDJFLX10Screen._trickleTimer     = 0;
+PioneerDDJFLX10Screen._TRICKLE_MS       = 125;   // 8 Hz — matches the daemon's
+                                                 // proven-safe RefreshThread rate
+PioneerDDJFLX10Screen._lastTrickleEntry = {1: -1, 2: -1, 3: -1, 4: -1};
+
+PioneerDDJFLX10Screen._startTrickle = function() {
+    if (!this._TRICKLE_ENABLE) { return; }
+    if (this._trickleTimer) { return; }
+    var self = this;
+    this._trickleTimer = engine.beginTimer(this._TRICKLE_MS, function() {
+        if (self._txQueue.length > 0) { return; }   // bulk upload in progress
+        for (var d = 1; d <= 4; d++) {
+            var ent = self._entries[d];
+            if (!ent) { continue; }
+            var group = "[Channel" + d + "]";
+            if (!(engine.getValue(group, "duration") > 0)) {
+                self._entries[d] = null;            // track unloaded
+                self._lastTrickleEntry[d] = -1;
+                continue;
+            }
+            var nEntries = ent.length / 2;
+            var ppos = engine.getValue(group, "playposition");
+            if (!(ppos >= 0)) { ppos = 0; }
+            var park = Math.floor(ppos * nEntries);
+            if (park < 0) { park = 0; }
+            if (park > nEntries - 19) { park = Math.max(0, nEntries - 19); }
+            // DEDUP (daemon's key fix): only send when the playhead entry has
+            // actually advanced. When paused/cued the entry is constant → zero
+            // xx36 traffic → xx27 flows unimpeded. This is what stopped the
+            // daemon's xx27-stall hang.
+            if (park === self._lastTrickleEntry[d]) { continue; }
+            self._lastTrickleEntry[d] = park;
+            self._sendScrollUpdate(d, park, ent, true);
+        }
+    });
+};
+
+
+// ===== EQ-reactive waveform (Phase B) ======================================
+// Re-pack + re-upload the visible window around each deck's playhead with the
+// live 3-band EQ applied, matching Mixxx's WaveformRendererRGB exactly:
+//   lowGain/midGain/highGain = EQ parameter1/2/3 (gated by filterWaveformEnable,
+//   forced to 0 by the kill buttons); eqGain = (Σ band·gain)/(Σ band) scales the
+//   bar HEIGHT, and the per-band gains scale the COLOR. No QuickEffect filter
+//   knob (Mixxx's wave doesn't react to it). Only the small jog-visible window
+//   is refreshed, and only when the EQ changes / the playhead moves / a periodic
+//   keep-alive is due — so an idle-EQ deck costs ~nothing and this also prevents
+//   the firmware's ~1-min wave drop. Enqueued through the budgeted sender so it
+//   never preempts xx27.
+PioneerDDJFLX10Screen._EQ_REACTIVE    = true;
+PioneerDDJFLX10Screen._EQ_WINDOW      = 1500;   // base entries each side at zoom=1
+                                                // (~10s @150fps). Scaled by the live
+                                                // waveform_zoom so it always covers
+                                                // the visible jog span (the jog
+                                                // zooms with waveform_zoom);
+                                                // otherwise zoomed-out edges stay
+                                                // un-EQ'd.
+PioneerDDJFLX10Screen._EQ_WINDOW_MAX  = 6000;   // cap (~+-40s) to bound refresh cost
+PioneerDDJFLX10Screen._EQ_REFRESH_MS  = 50;     // poll EQ/playhead/zoom at 20Hz
+PioneerDDJFLX10Screen._EQ_KEEPALIVE_MS = 8000;  // re-assert wave even if idle
+PioneerDDJFLX10Screen._wfBands        = {1: null, 2: null, 3: null, 4: null};
+PioneerDDJFLX10Screen._lastEqKey      = {1: "", 2: "", 3: "", 4: ""};
+PioneerDDJFLX10Screen._lastWinCenter  = {1: -1, 2: -1, 3: -1, 4: -1};
+PioneerDDJFLX10Screen._lastEqRefresh  = {1: 0, 2: 0, 3: 0, 4: 0};
+PioneerDDJFLX10Screen._refreshTimer   = 0;
+// EQ-refresh packets live in their own PER-DECK queues (separate from the
+// track-load bulk _txQueue) so a live knob sweep can DISCARD that deck's stale
+// pending window and replace it with the latest each tick — the needle always
+// shows the current EQ instead of draining hundreds of out-of-date frames
+// first. Per-deck so sweeping one deck never drops another deck's EQ frames.
+// Drained after the bulk, round-robin, within the same per-tick budget.
+PioneerDDJFLX10Screen._refreshQueue   = {1: [], 2: [], 3: [], 4: []};
+PioneerDDJFLX10Screen._refreshRR      = 0;
+
+// Live EQ band multipliers for a deck (1.0 = unity), matching Mixxx getGains().
+PioneerDDJFLX10Screen._eqGains = function(deck) {
+    var ch = "[Channel" + deck + "]";
+    if (!(engine.getValue(ch, "filterWaveformEnable") > 0)) {
+        return {low: 1, mid: 1, high: 1};   // EQ→waveform disabled: flat
+    }
+    var eq = "[EqualizerRack1_[Channel" + deck + "]_Effect1]";
+    var low  = engine.getValue(eq, "parameter1");
+    var mid  = engine.getValue(eq, "parameter2");
+    var high = engine.getValue(eq, "parameter3");
+    if (engine.getValue(eq, "button_parameter1") > 0) { low = 0; }
+    if (engine.getValue(eq, "button_parameter2") > 0) { mid = 0; }
+    if (engine.getValue(eq, "button_parameter3") > 0) { high = 0; }
+    return {low: low, mid: mid, high: high};
+};
+
+// Enqueue xx36 packets for entries [start, start+count) with EQ gains applied.
+PioneerDDJFLX10Screen._enqueueWindow = function(deck, start, count, g, center) {
+    var wf = this._wfBands[deck];
+    if (!wf) { return; }
+    var total = Math.floor(wf.length / 4);
+    if (start < 0) { start = 0; }
+    var end = start + count;
+    if (end > total) { end = total; }
+    if (end <= start) { return; }
+    if (center === undefined) { center = (start + end) / 2; }
+    var db = this._DECK_BYTE[deck - 1];
+    // Packet start positions tiling [start,end), ordered CENTER-OUT (nearest the
+    // playhead/needle first). The eye tracks the needle, so refreshing it first
+    // makes an EQ change feel instant even while the window edges trail by a few
+    // hundred ms as they drain through the budget.
+    var positions = [];
+    for (var p0 = start; p0 < end; p0 += 19) { positions.push(p0); }
+    positions.sort(function(a, b) {
+        return Math.abs(a + 9 - center) - Math.abs(b + 9 - center);
+    });
+    for (var pi = 0; pi < positions.length; pi++) {
+        var pos = positions[pi];
+        var take = Math.min(19, end - pos);
+        var p = this._zeros();
+        p[0] = db;  p[1] = 0x36;  p[2] = 0x00;  p[4] = 0x00;  p[6] = 0x13;
+        p[10] =  pos        & 0xff;
+        p[11] = (pos >> 8)  & 0xff;
+        p[12] = (pos >> 16) & 0xff;
+        p[13] = (pos >> 24) & 0xff;
+        for (var j = 0; j < take; j++) {
+            var idx  = (pos + j) * 4;
+            var all  = wf[idx];
+            var low  = wf[idx + 1];
+            var mid  = wf[idx + 2];
+            var high = wf[idx + 3];
+            var sum  = low + mid + high;
+            var lowS = low * g.low, midS = mid * g.mid, highS = high * g.high;
+            var eqGain = sum > 0 ? (lowS + midS + highS) / sum : 1;
+            var v = this._packBin(all * eqGain, lowS, midS, highS);
+            p[14 + j * 2]     = v & 0xff;
+            p[14 + j * 2 + 1] = (v >> 8) & 0xff;
+        }
+        this._refreshQueue[deck].push(p);
+    }
+};
+
+PioneerDDJFLX10Screen._startEqRefresh = function() {
+    if (this._refreshTimer) { return; }
+    var self = this;
+    this._refreshTimer = engine.beginTimer(this._EQ_REFRESH_MS, function() {
+        var now = Date.now();
+        for (var d = 1; d <= 4; d++) {
+            var wf = self._wfBands[d];
+            if (!wf) { continue; }
+            var group = "[Channel" + d + "]";
+            if (!(engine.getValue(group, "duration") > 0)) {
+                self._wfBands[d] = null;   // track unloaded
+                self._refreshQueue[d] = [];
+                continue;
+            }
+            var total = Math.floor(wf.length / 4);
+            var g = self._eqGains(d);
+            // Scale the window to the live zoom so it covers the whole visible
+            // jog span (the jog zooms with waveform_zoom; zoom 1 = most zoomed
+            // in). Without this the zoomed-out edges stay un-EQ'd.
+            var zoom = engine.getValue(group, "waveform_zoom");
+            if (!(zoom >= 1)) { zoom = 1; }
+            var win = Math.round(self._EQ_WINDOW * zoom);
+            if (win > self._EQ_WINDOW_MAX) { win = self._EQ_WINDOW_MAX; }
+            var eqKey = g.low + "," + g.mid + "," + g.high + "," + zoom;
+            var ppos = engine.getValue(group, "playposition");
+            if (!(ppos >= 0)) { ppos = 0; }
+            var center = Math.floor(ppos * total);
+            var eqChanged = eqKey !== self._lastEqKey[d];
+            var moved = Math.abs(center - self._lastWinCenter[d]) > (win / 2);
+            var keepalive = (now - self._lastEqRefresh[d]) > self._EQ_KEEPALIVE_MS;
+            if (eqChanged || moved || keepalive) {
+                // Replace this deck's pending window with a fresh center-out one
+                // for the latest EQ — stale frames from a prior tick are dropped
+                // so a live sweep tracks the knob instead of lagging behind them.
+                self._refreshQueue[d] = [];
+                self._enqueueWindow(d, center - win, win * 2, g, center);
+                self._lastEqKey[d] = eqKey;
+                self._lastWinCenter[d] = center;
+                self._lastEqRefresh[d] = now;
+            }
+        }
+    });
+};
+
+
+// ===== xx 2f — dense 16ms beat grid (62.5 Hz), used for needle interpolation =
+PioneerDDJFLX10Screen._XX2F_SR        = 22050;
+PioneerDDJFLX10Screen._XX2F_BEAT_TYPE = [0x03, 0x04, 0x00, 0x02];
+PioneerDDJFLX10Screen._XX2F_RECS_PKT  = 30;
+PioneerDDJFLX10Screen._XX2F_MARKER    = [0x80, 0x02, 0x01, 0x00];
+PioneerDDJFLX10Screen._XX2F_INTERVAL_MS = 16.0;
+
+PioneerDDJFLX10Screen._sendBeatGrid = function(deck, durationSec, bpm) {
+    if (!(bpm > 0) || !(durationSec > 0)) { return; }   // daemon skips too
+    var db = this._DECK_BYTE[deck - 1];
+    var nRecords = Math.floor(durationSec * 1000.0 / this._XX2F_INTERVAL_MS);
+    var totalRecs = nRecords + 1;   // + the leading marker record
+    var perPkt = this._XX2F_RECS_PKT;
+    var totalSegs = Math.max(1, Math.ceil(totalRecs / perPkt));
+    var recIdx = 0;
+    for (var seg = 0; seg < totalSegs; seg++) {
+        var p = this._zeros();
+        p[0] = db;
+        p[1] = 0x2f;
+        p[2] = (seg + 1) & 0xff;
+        p[4] = 0x15;
+        var off = 6;
+        for (var k = 0; k < perPkt && recIdx < totalRecs; k++) {
+            var b0, b1, b2, b3;
+            if (recIdx === 0) {
+                b0 = this._XX2F_MARKER[0]; b1 = this._XX2F_MARKER[1];
+                b2 = this._XX2F_MARKER[2]; b3 = this._XX2F_MARKER[3];
+            } else {
+                var beatIdx = recIdx - 1;
+                var samples = (Math.round(beatIdx * this._XX2F_INTERVAL_MS *
+                    this._XX2F_SR / 1000.0)) & 0xffffff;
+                b0 = this._XX2F_BEAT_TYPE[beatIdx & 0x03];
+                b1 = samples & 0xff;
+                b2 = (samples >> 8) & 0xff;
+                b3 = (samples >> 16) & 0xff;
+            }
+            p[off] = b0; p[off + 1] = b1; p[off + 2] = b2; p[off + 3] = b3;
+            off += 4;
+            recIdx++;
+        }
+        this._sendRaw(p);
     }
 };
 
 
 // ===== Track-load handler ===================================================
+// NATIVE waveform: when true, screen.js uploads the waveform itself using the
+// engine.getWaveformSummary() API (no external daemon). Set false to defer the
+// xx30/35/36 upload to flx10_screen_daemon.py.
+PioneerDDJFLX10Screen._NATIVE_WAVEFORM = true;
+PioneerDDJFLX10Screen._wfPollTimer = {1: 0, 2: 0, 3: 0, 4: 0};
+
 PioneerDDJFLX10Screen._onTrackLoad = function(deck) {
+    if (!this._NATIVE_WAVEFORM) {
+        return;   // external daemon handles the xx30/35/36 upload
+    }
     var group = "[Channel" + deck + "]";
-    // DIAGNOSTIC: log all candidate COs so we can figure out which one
-    // matches what Mixxx's UI timer displays. The user reports a constant
-    // 14-20s offset between our (playposition × duration) calc and what
-    // Mixxx UI shows — possibly intro/outro marker driven.
     var duration = engine.getValue(group, "duration");
-    var pos      = engine.getValue(group, "playposition");
-    var cue      = engine.getValue(group, "cue_point");
-    var samples  = engine.getValue(group, "track_samples");
-    var sr       = engine.getValue(group, "track_samplerate");
-    var intro_s  = engine.getValue(group, "intro_start_position");
-    var intro_e  = engine.getValue(group, "intro_end_position");
-    var outro_s  = engine.getValue(group, "outro_start_position");
-    var outro_e  = engine.getValue(group, "outro_end_position");
-    console.log("FLX10 screen: track loaded on deck " + deck +
-                " | duration=" + duration + " pos=" + pos +
-                " cue_point=" + cue + " samples=" + samples + " sr=" + sr +
-                " intro_s=" + intro_s + " intro_e=" + intro_e +
-                " outro_s=" + outro_s + " outro_e=" + outro_e);
-    // Daemon handles xx 30/35/39/33/2f init + xx 36 wave upload.
-    // screen.js's only HID job is the xx 27 state ping.
+    if (!(duration > 0)) { return; }
+    // The analysed waveform lands in Track memory a moment after load, so poll
+    // engine.getWaveformSummary() until it's ready, then do the upload.
+    if (this._wfPollTimer[deck]) {
+        engine.stopTimer(this._wfPollTimer[deck]);
+        this._wfPollTimer[deck] = 0;
+    }
+    var self = this;
+    var tries = 0;
+    this._wfPollTimer[deck] = engine.beginTimer(150, function() {
+        tries++;
+        var entries = self._generateEntries(deck, duration);
+        if (entries && entries.length) {
+            engine.stopTimer(self._wfPollTimer[deck]);
+            self._wfPollTimer[deck] = 0;
+            self._uploadWaveform(deck, duration, entries);
+        } else if (tries >= 40) {   // ~6 s
+            engine.stopTimer(self._wfPollTimer[deck]);
+            self._wfPollTimer[deck] = 0;
+            console.log("FLX10 screen: waveform not ready for deck " + deck +
+                        " after " + tries + " polls");
+        }
+    });
 };
 
 
@@ -1461,6 +1926,19 @@ PioneerDDJFLX10Screen.init = function(id) {
     }
     this._stateTimer = engine.beginTimer(this._STATE_MS, modeFn, false);
 
+    // Arm all 4 decks at startup (xx30 + xx39) exactly like the daemon does
+    // before any track loads. Without this the firmware won't accept waveform
+    // data on a not-yet-initialised deck (observed: deck 2 stayed blank even
+    // after a clean upload).
+    if (this._NATIVE_WAVEFORM) {
+        for (var ad = 1; ad <= 4; ad++) {
+            this._sendInit30(ad, 0);
+            this._sendXX39(ad);
+        }
+        this._startTrickle();
+        if (this._EQ_REACTIVE) { this._startEqRefresh(); }
+    }
+
     // Track-load detection only — xx 27 updates come from the timer above
     // (NOT event-driven, because Mixxx throttles makeConnection callbacks
     // on playposition).
@@ -1488,6 +1966,16 @@ PioneerDDJFLX10Screen.shutdown = function() {
         engine.stopTimer(this._stateTimer);
         this._stateTimer = null;
     }
+    if (this._trickleTimer) {
+        engine.stopTimer(this._trickleTimer);
+        this._trickleTimer = 0;
+    }
+    if (this._refreshTimer) {
+        engine.stopTimer(this._refreshTimer);
+        this._refreshTimer = 0;
+    }
+    this._txQueue = [];   // drop any pending bulk packets
+    this._refreshQueue = {1: [], 2: [], 3: [], 4: []};
 };
 
 // ACK packets (xx D8 ...) arrive on EP4 IN; we don't need to act on them.
