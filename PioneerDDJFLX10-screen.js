@@ -359,7 +359,24 @@ PioneerDDJFLX10Screen._stateTimer    = null;
 
 
 // ===== Raw HID send via Mixxx ===============================================
+PioneerDDJFLX10Screen._lastSentPkt = null;
 PioneerDDJFLX10Screen._send = function(pkt) {
+    // Skip byte-identical consecutive packets (our own dedup). Mixxx's
+    // HidIoThread already drops identical OutputReports from its cache, but it
+    // logs "Skipped sending identical OutputReport" at debug level for EACH one
+    // — at 200 Hz a paused/idle deck sends the same xx27 every tick, spamming
+    // the log. Deduping here means we never hand Mixxx the duplicate, so no
+    // skip-log and no change in what reaches the device (Mixxx wasn't writing
+    // it anyway). _buildState returns a fresh array each call, so storing the
+    // reference is safe.
+    if (this._lastSentPkt && pkt.length === this._lastSentPkt.length) {
+        var same = true;
+        for (var i = 0; i < pkt.length; i++) {
+            if (pkt[i] !== this._lastSentPkt[i]) { same = false; break; }
+        }
+        if (same) { return; }
+    }
+    this._lastSentPkt = pkt;
     controller.send(pkt, null, 0);
 };
 

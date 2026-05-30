@@ -93,7 +93,10 @@ var PioneerDDJFLX10 = {};
 
 // Global state
 PioneerDDJFLX10.shiftActive = false;
-PioneerDDJFLX10._rateMSB = {1: 0, 2: 0, 3: 0, 4: 0};
+// Seed to CENTER (0x40 MSB / 0 LSB ≈ rate 0) so _sliderRate() returns ~0 before
+// the fader has been physically moved — otherwise a 0/0 reading computes +1 (max)
+// and releasing TEMPO RESET before touching the fader would jump tempo to max.
+PioneerDDJFLX10._rateMSB = {1: 0x40, 2: 0x40, 3: 0x40, 4: 0x40};
 PioneerDDJFLX10._rateLSB = {1: 0, 2: 0, 3: 0, 4: 0};
 PioneerDDJFLX10._jogTouches = {1: false, 2: false, 3: false, 4: false};
 PioneerDDJFLX10._jogLastValue = {1: 0, 2: 0, 3: 0, 4: 0};
@@ -312,6 +315,12 @@ PioneerDDJFLX10.init = function(id) {
         engine.makeConnection(grp, "vu_meter", PioneerDDJFLX10["LedVuMeterCH" + i]);
         // Force off au démarrage pour éviter LEDs fantômes
         midi.sendShortMsg(0xB0 + (i - 1), 0x02, 0x00);
+        // Clear sync-button LEDs at init — the FLX10 powers up with these lit,
+        // and Mixxx doesn't proactively send the off state. BEAT SYNC = note
+        // 0x58, KEY SYNC = note 0x65, on the deck's channel (0x90+(i-1)).
+        midi.sendShortMsg(0x90 + (i - 1), 0x58, 0x00);   // beat sync off
+        midi.sendShortMsg(0x90 + (i - 1), 0x65, 0x00);   // key sync off
+        midi.sendShortMsg(0x90 + (i - 1), 0x41, 0x00);   // tempo reset off
         // Duration cache (no MIDI — used by HID path and, if re-enabled, jogTime).
         PioneerDDJFLX10._trackDuration[i] = engine.getValue(grp, "duration");
         // Legacy MIDI jog-display path — OFF by default (see _MIDI_JOG_DISPLAY).
@@ -336,6 +345,8 @@ PioneerDDJFLX10.init = function(id) {
 
     // LEDs Play/Cue avancées (Pioneer-like)
     PioneerDDJFLX10._initAdvancedLeds();
+    // Hot-cue pad LEDs: light pads that have a hot cue set.
+    PioneerDDJFLX10._initHotcueLeds();
 
     if (typeof PioneerDDJFLX10.screen !== "undefined") {
         PioneerDDJFLX10.screen.start();
@@ -579,8 +590,9 @@ PioneerDDJFLX10.rate_lsb = function(channel, control, value, status, group) {
     PioneerDDJFLX10._updateRate(deck);
 };
 
-PioneerDDJFLX10._updateRate = function(deck) {
-    var group = "[Channel" + deck + "]";
+// Convert the deck's 14-bit pitch-fader position (_rateMSB/_rateLSB) to a
+// Mixxx `rate` value (-1..+1, Pioneer-inverted).
+PioneerDDJFLX10._sliderRate = function(deck) {
     var msb = PioneerDDJFLX10._rateMSB[deck] || 0;
     var lsb = PioneerDDJFLX10._rateLSB[deck] || 0;
     var value = (msb << 7) | lsb;                 // 0..16383
@@ -588,7 +600,20 @@ PioneerDDJFLX10._updateRate = function(deck) {
     norm = -norm;                                 // inversion Pioneer
     if (norm > 1) norm = 1;
     if (norm < -1) norm = -1;
-    engine.setValue(group, "rate", norm);
+    return norm;
+};
+
+PioneerDDJFLX10._updateRate = function(deck) {
+    // While TEMPO RESET is engaged the fader is disconnected: keep tracking its
+    // position (_rateMSB/_rateLSB are still updated by the handlers) but DON'T
+    // apply it, so the tempo stays pinned at 0%. Releasing the button picks up
+    // the fader's then-current position.
+    if (PioneerDDJFLX10._tempoResetEngaged &&
+        PioneerDDJFLX10._tempoResetEngaged[deck]) {
+        return;
+    }
+    engine.setValue("[Channel" + deck + "]", "rate",
+                    PioneerDDJFLX10._sliderRate(deck));
 };
 
 // Shutdown
@@ -977,12 +1002,34 @@ PioneerDDJFLX10.TimeTypeChange = function(channel, control, value, status, group
 PioneerDDJFLX10.rate_reset = function(channel, control, value, status, group) {
     if (value === 0x7F) {
         engine.setValue(group, "rate_set_default", 1);
-        
+
         // Reset internal values
         var deck = PioneerDDJFLX10._getDeckFromGroup(group);
         PioneerDDJFLX10._rateMSB[deck] = 0x40; // Center value (0x40 = 64)
         PioneerDDJFLX10._rateLSB[deck] = 0x00;
     }
+};
+
+// ─── TEMPO RESET button (note 0x41) — hold at 0% ─────────────────────────────
+// 1st press (ENGAGE): force tempo to 0% (the track's original BPM) and light
+//   the button. While engaged the pitch fader is DISCONNECTED — moving it does
+//   nothing to the tempo (see _updateRate) — so you can physically slide the
+//   fader back to 0 without the tempo jumping around.
+// 2nd press (RELEASE): clear the light and snap the tempo to wherever the fader
+//   now physically sits (so if you re-zeroed it, tempo stays at 0% smoothly).
+PioneerDDJFLX10._tempoResetEngaged = {1: false, 2: false, 3: false, 4: false};
+
+PioneerDDJFLX10.tempoResetToggle = function(channel, control, value, status, group) {
+    if (value === 0) { return; }   // act on press only
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    var engaged = !PioneerDDJFLX10._tempoResetEngaged[deck];
+    PioneerDDJFLX10._tempoResetEngaged[deck] = engaged;
+    if (engaged) {
+        engine.setValue(group, "rate", 0.0);                        // hold at 0%
+    } else {
+        engine.setValue(group, "rate", PioneerDDJFLX10._sliderRate(deck)); // follow fader
+    }
+    midi.sendShortMsg(status, control, engaged ? 0x7F : 0x00);      // LED on note 0x41
 };
 
 // Cue button management
@@ -1108,17 +1155,16 @@ PioneerDDJFLX10._renderAdvanced = function(deck){
   var playOn=0, cueOn=0;
 
   if (st.play) {
+    // Playing → PLAY solid ON.
     playOn = 1;
     cueOn  = st.hold ? 1 : 0;
   } else {
-    if (st.hold) {
-      playOn = 0; cueOn = 1;
-    } else if (st.cue) {
-      playOn = st.phase ? 1 : 0;
-      cueOn  = st.phase ? 0 : 1;
-    } else {
-      playOn = 0; cueOn = 0;
-    }
+    // Not playing → PLAY FLASHES (toggled by _advTimer's phase) whenever a
+    // track is loaded; off if the deck is empty. CUE stays solid while held
+    // or while sitting on the cue point.
+    var hasTrack = engine.getValue("[Channel" + deck + "]", "track_samples") > 0;
+    playOn = (hasTrack && st.phase) ? 1 : 0;
+    cueOn  = (st.hold || st.cue) ? 1 : 0;
   }
 
   PioneerDDJFLX10._sendLed(deck, 0x0B, playOn);
@@ -1157,6 +1203,159 @@ if (!PioneerDDJFLX10._advTimer) {
 
 PioneerDDJFLX10._initAdvancedLeds = PioneerDDJFLX10._initAdvancedLeds || function(){
   [1,2,3,4].forEach(PioneerDDJFLX10._connectAdvanced);
+};
+
+// ─── HOT CUE pad LEDs ─────────────────────────────────────────────────────────
+// Light each hot-cue pad when a hot cue exists at that slot, dark when empty.
+// Pads are RGB (value = palette color 1..127, 0x00 = off). Hot-cue mode pads:
+//   deck N → status 0x97 + (N-1)*2  (0x97/0x99/0x9B/0x9D), pad P → note (P-1).
+// "Light up if it exists" = a fixed color when hotcue_P_enabled; per-cue colors
+// would need the FLX10's palette map (future).
+PioneerDDJFLX10._HOTCUE_STATUS    = {1: 0x97, 2: 0x99, 3: 0x9B, 4: 0x9D};
+PioneerDDJFLX10._HOTCUE_DEFAULT_COLOR = 0x7F;  // pad palette value until we map real colors
+PioneerDDJFLX10._HOTCUE_LOOP_TYPE = 4;         // Mixxx CueType::Loop (needs Mixxx 2.4+)
+PioneerDDJFLX10._hotcuePhase = false;          // shared blink phase for loop cues
+PioneerDDJFLX10._hotcue = {};                  // _hotcue[deck][pad] = {on, loop, color}
+
+// FLX10 hot-cue pad palette (discovered 2026-05-29 via _hotcuePaletteTest).
+// The pad value is a HUE WHEEL: value 1 = blue, sweeping teal→green→yellow→
+// orange→red→pink→magenta→purple by ~61; values >61 saturate to purple. So we
+// map any Mixxx hot-cue color to the palette entry with the nearest hue.
+// {v: pad value, h: approximate hue in degrees}
+PioneerDDJFLX10._HOTCUE_PALETTE = [
+  {v: 1,  h: 240}, // blue
+  {v: 5,  h: 228}, // blue
+  {v: 9,  h: 216}, // blue
+  {v: 13, h: 200}, // blue
+  {v: 17, h: 180}, // teal / cyan
+  {v: 21, h: 120}, // green
+  {v: 25, h: 85},  // green-yellow
+  {v: 29, h: 60},  // yellow
+  {v: 33, h: 45},  // yellow-orange
+  {v: 37, h: 30},  // orange
+  {v: 41, h: 0},   // red
+  {v: 45, h: 350}, // red-pink
+  {v: 49, h: 340}, // light pink
+  {v: 53, h: 330}, // pink
+  {v: 57, h: 300}, // magenta
+  {v: 61, h: 275}  // purple
+];
+
+PioneerDDJFLX10._rgbToHue = function(r, g, b){
+  r /= 255; g /= 255; b /= 255;
+  var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (d === 0) { return -1; }   // gray / white: no hue
+  var h;
+  if (max === r)      { h = ((g - b) / d) % 6; }
+  else if (max === g) { h = (b - r) / d + 2; }
+  else                { h = (r - g) / d + 4; }
+  h *= 60;
+  if (h < 0) { h += 360; }
+  return h;
+};
+
+PioneerDDJFLX10._hueDist = function(a, b){
+  var d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+};
+
+// Value 127 is the whitest the pads get (faintly pink — there's no pure white
+// in this palette). Used for white / near-white / grayscale cues.
+PioneerDDJFLX10._HOTCUE_WHITE_VALUE = 127;
+
+// Map a Mixxx hot-cue color (integer 0xRRGGBB from hotcue_X_color) to a pad
+// palette value. Low-saturation colors (white/gray) → the white value;
+// otherwise pick the palette entry with the nearest hue.
+PioneerDDJFLX10._hotcueColorToPad = function(rgb){
+  if (!(rgb > 0)) { return PioneerDDJFLX10._HOTCUE_WHITE_VALUE; }
+  var r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+  var max = Math.max(r, g, b), min = Math.min(r, g, b);
+  // Saturation (HSV). Near-white (and Mixxx's faintly-tinted white) has low
+  // saturation — treat as white instead of computing a misleading hue.
+  var sat = (max === 0) ? 0 : (max - min) / max;
+  if (sat < 0.18) { return PioneerDDJFLX10._HOTCUE_WHITE_VALUE; }
+  var hue = PioneerDDJFLX10._rgbToHue(r, g, b);
+  if (hue < 0) { return PioneerDDJFLX10._HOTCUE_WHITE_VALUE; }
+  var best = PioneerDDJFLX10._HOTCUE_PALETTE[0], bestD = 999;
+  for (var i = 0; i < PioneerDDJFLX10._HOTCUE_PALETTE.length; i++) {
+    var dist = PioneerDDJFLX10._hueDist(hue, PioneerDDJFLX10._HOTCUE_PALETTE[i].h);
+    if (dist < bestD) { bestD = dist; best = PioneerDDJFLX10._HOTCUE_PALETTE[i]; }
+  }
+  return best.v;
+};
+
+PioneerDDJFLX10._renderHotcue = function(deck, pad){
+  var s = PioneerDDJFLX10._hotcue[deck][pad];
+  var val;
+  if (!s.on)        { val = 0x00; }                                  // empty → off
+  else if (s.loop)  { val = PioneerDDJFLX10._hotcuePhase ? s.color : 0x00; }  // loop → blink
+  else              { val = s.color; }                               // cue → solid
+  midi.sendShortMsg(PioneerDDJFLX10._HOTCUE_STATUS[deck], pad - 1, val);
+};
+
+// ── PALETTE DISCOVERY ─────────────────────────────────────────────────────
+// Set true and reload the mapping to light every pad with a DISTINCT value
+// (also logged), so you can report which value = which color. Each pad gets
+// value = 1 + index*4 across all 4 decks: deck1 = 1,5,9,…,29; deck2 = 33,…,61;
+// deck3 = 65,…,93; deck4 = 97,…,125 (toggle decks to see decks 3/4). Tell me
+// the color for the values you can read, then set this back to false.
+PioneerDDJFLX10._HOTCUE_PALETTE_TEST = false;
+
+PioneerDDJFLX10._hotcuePaletteTest = function(){
+  console.log("FLX10 HOTCUE PALETTE TEST (round 2) — switch pads to HOT CUE mode; report colors:");
+  for (var deck = 1; deck <= 4; deck++) {
+    for (var pad = 1; pad <= 8; pad++) {
+      var index = (deck - 1) * 8 + (pad - 1);   // 0..31
+      var val = 3 + index * 4;                   // 3,7,11,…,127 (the gaps + the top end)
+      midi.sendShortMsg(PioneerDDJFLX10._HOTCUE_STATUS[deck], pad - 1, val);
+      console.log("  deck" + deck + " pad" + pad + " -> value " + val +
+                  " (0x" + (val < 16 ? "0" : "") + val.toString(16) + ")");
+    }
+  }
+};
+
+PioneerDDJFLX10._initHotcueLeds = function(){
+  if (PioneerDDJFLX10._HOTCUE_PALETTE_TEST) {
+    PioneerDDJFLX10._hotcuePaletteTest();
+    return;   // skip normal hot-cue LED wiring while discovering the palette
+  }
+  for (var deck = 1; deck <= 4; deck++) {
+    PioneerDDJFLX10._hotcue[deck] = {};
+    (function(deck){
+      var g = "[Channel" + deck + "]";
+      for (var pad = 1; pad <= 8; pad++) {
+        (function(pad){
+          PioneerDDJFLX10._hotcue[deck][pad] =
+              {on: false, loop: false, color: PioneerDDJFLX10._HOTCUE_DEFAULT_COLOR};
+          var s = PioneerDDJFLX10._hotcue[deck][pad];
+          var refresh = function(){
+            s.on    = engine.getValue(g, "hotcue_" + pad + "_enabled") > 0;
+            s.loop  = engine.getValue(g, "hotcue_" + pad + "_type") ===
+                      PioneerDDJFLX10._HOTCUE_LOOP_TYPE;
+            s.color = PioneerDDJFLX10._hotcueColorToPad(
+                          engine.getValue(g, "hotcue_" + pad + "_color"));
+            PioneerDDJFLX10._renderHotcue(deck, pad);
+          };
+          engine.makeConnection(g, "hotcue_" + pad + "_enabled", refresh);
+          engine.makeConnection(g, "hotcue_" + pad + "_type",    refresh);
+          engine.makeConnection(g, "hotcue_" + pad + "_color",   refresh);
+          refresh();   // seed current state at init
+        })(pad);
+      }
+    })(deck);
+  }
+  // Blink timer — re-renders only the loop hot cues (~1 Hz).
+  if (!PioneerDDJFLX10._hotcueBlinkTimer) {
+    PioneerDDJFLX10._hotcueBlinkTimer = engine.beginTimer(500, function(){
+      PioneerDDJFLX10._hotcuePhase = !PioneerDDJFLX10._hotcuePhase;
+      for (var d = 1; d <= 4; d++) {
+        for (var p = 1; p <= 8; p++) {
+          var s = PioneerDDJFLX10._hotcue[d][p];
+          if (s.on && s.loop) { PioneerDDJFLX10._renderHotcue(d, p); }
+        }
+      }
+    });
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
