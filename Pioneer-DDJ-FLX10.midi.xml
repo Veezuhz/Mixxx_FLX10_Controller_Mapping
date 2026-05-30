@@ -4483,6 +4483,39 @@
                  PioneerDDJFLX10.keySyncToggle (custom on/off toggle). The
                  sync_key auto-output bindings were removed so Mixxx doesn't
                  fight the script over the button LED. -->
+            <!-- BEAT SYNC button LED (note 0x58): light when sync_enabled is on. -->
+            <output>
+                <group>[Channel1]</group>
+                <key>sync_enabled</key>
+                <description>Beat Sync LED CH1</description>
+                <status>0x90</status>
+                <midino>0x58</midino>
+                <minimum>0.5</minimum>
+            </output>
+            <output>
+                <group>[Channel2]</group>
+                <key>sync_enabled</key>
+                <description>Beat Sync LED CH2</description>
+                <status>0x91</status>
+                <midino>0x58</midino>
+                <minimum>0.5</minimum>
+            </output>
+            <output>
+                <group>[Channel3]</group>
+                <key>sync_enabled</key>
+                <description>Beat Sync LED CH3</description>
+                <status>0x92</status>
+                <midino>0x58</midino>
+                <minimum>0.5</minimum>
+            </output>
+            <output>
+                <group>[Channel4]</group>
+                <key>sync_enabled</key>
+                <description>Beat Sync LED CH4</description>
+                <status>0x93</status>
+                <midino>0x58</midino>
+                <minimum>0.5</minimum>
+            </output>
             <output>
                 <group>[Channel2]</group>
                 <key>cue_indicator</key>

@@ -811,11 +811,11 @@ def handle_track_load(ep, deck, pwv5, label="", duration_sec=0.0, file_bpm=0.0):
     DECKS[deck].uploading = True
     try:
         send_xx30(ep, deck, duration_sec=duration_sec)
-        # xx39 = BLUE KEY-SYNC indicator on the jog screen (confirmed 2026-05-29:
-        # removing it made the blue indicator disappear). Serato was simply not
-        # key-syncing in the loading4tracks capture, hence its absence there.
-        # TODO: drive this from Mixxx's key-sync / keylock state per deck instead
-        # of sending it unconditionally at every track load.
+        # xx39 = HOT CUE display setup (the packet payload contains the ASCII
+        # "HOT CUE" — decoded 2026-05-29). NOT a key-sync indicator: the earlier
+        # "blue indicator" attribution was wrong. Removing xx39 dropped a hot-cue
+        # UI element from the jog screen, which is why it looked like a missing
+        # indicator. Sent once per track load to set up the hot-cue display.
         send_xx39(ep, deck)
         upload_xx33_album_art(ep, deck, get_test_jpeg())
         # xx 35 entry count = duration × 150, matching Serato's pattern.
@@ -1171,7 +1171,7 @@ def main():
     print("Sending xx 30 + xx 39 init to all 4 decks …")
     for d in (1, 2, 3, 4):
         send_xx30(ep_out, d)
-        send_xx39(ep_out, d)   # xx39 = blue key-sync indicator (see handle_track_load TODO)
+        send_xx39(ep_out, d)   # xx39 = HOT CUE display setup (see handle_track_load)
 
     # xx 27 is handled ENTIRELY by Mixxx's HID screen.js, with zero position
     # bytes [5..7] (so firmware uses [9..12] for accurate time). Wave shape

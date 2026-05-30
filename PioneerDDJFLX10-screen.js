@@ -574,8 +574,15 @@ PioneerDDJFLX10Screen._buildState = function(deckByte, trackLoaded) {
             0x84,   // 23 B♭ minor    = 3A
             0x86    // 24 B minor     = 10A
         ];
-        var fileKey = engine.getValue(group, "file_key");
-        var keyIdx  = (fileKey | 0);
+        // 2026-05-29: read the CURRENT key (`key` CO) so the on-screen Camelot
+        // value follows key changes — e.g. when KEY SYNC (sync_key) shifts the
+        // deck to match the other deck, or any pitch-driven key shift. `key`
+        // uses the same 1..24 enum as file_key. Fall back to file_key if the
+        // current key is unavailable (0), e.g. an un-keyed track.
+        var keyIdx = engine.getValue(group, "key") | 0;
+        if (keyIdx < 1 || keyIdx > 24) {
+            keyIdx = engine.getValue(group, "file_key") | 0;
+        }
         if (keyIdx < 0 || keyIdx > 24) keyIdx = 0;
         p[29] = MIXXX_KEY_TO_B29[keyIdx];
 
