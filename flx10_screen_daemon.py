@@ -458,25 +458,17 @@ class RefreshThread(threading.Thread):
         self._stop    = threading.Event()
 
     def run(self):
-        # Send xx 36 packet at current playhead each tick. Dedup repeated
-        # entries (2026-05-29): Serato emits xx 36 only when entry advances,
-        # we now do the same to avoid the "redraw at same entry repeated"
-        # interpretation by the firmware.
-        # v7 (FLASH FIX) — CONTIGUOUS forward streaming, like Serato.
-        # Steady-play capture proved our xx27 position AND xx36 entry are both
-        # monotone (we never send zero/backward), yet the wave flashes to start
-        # ~1/sec — a firmware redraw. The anomaly vs Serato is xx36 coverage:
-        # ours was ~2.85 Hz, +56/packet (19-entry windows w/ ~37-entry GAPS);
-        # Serato is ~7.3 Hz, +18.5/packet, CONTIGUOUS. The 30 ms cap in
-        # interp_pos() stalled `entry` between sparse log updates. Fix: advance
-        # a contiguous cursor toward a FREE-RUNNING playhead in +19 steps,
-        # covering every entry; snap only on a real seek.
-        ENTRIES_PER_PKT   = 19
-        MAX_PKTS_PER_TICK = 32
-        SEEK_BACK         = 150
-        SEEK_FWD          = 600
+        # Simple xx 36 trickle: one packet per tick at the current playhead,
+        # deduped (skip when the entry hasn't advanced). 2026-05-29: REVERTED
+        # the v7 "contiguous free-running streaming" experiment. v7 was added
+        # for a starvation hypothesis that turned out WRONG (the once-per-second
+        # flash was the xx27 ms-overflow, fixed in screen.js). v7 pushed the
+        # xx36 rate to ~2x Serato (~14/s vs ~7/s) with bursts, and is the prime
+        # suspect for the ~27 s firmware hang (screen.js xx27 writes stalled
+        # while this hidraw trickle kept going). The wave scroll is driven by
+        # screen.js xx27, not this trickle — this just keeps the buffer alive.
+        ENTRIES_PER_PKT = 19
         while not self._stop.is_set():
-            now = time.time()
             for d in (1, 2, 3, 4):
                 st = DECKS[d]
                 if not (st.loaded and st.pwv5 and st.duration > 0):
@@ -484,36 +476,15 @@ class RefreshThread(threading.Thread):
                 if st.uploading:
                     continue   # don't fight the bulk buffer-fill (flash fix v6)
                 n_entries = len(st.pwv5) // 2
-                maxstart  = max(0, n_entries - ENTRIES_PER_PKT)
-                fpos = st.last_pos_val
-                if st.prev_pos_ts > 0:
-                    dtlog = st.last_pos_ts - st.prev_pos_ts
-                    if 0.010 < dtlog < 0.500:
-                        rate = (st.last_pos_val - st.prev_pos_val) / dtlog
-                        if 0.0 <= rate < 0.5:
-                            dt = now - st.last_pos_ts
-                            if dt > 1.0:
-                                dt = 1.0
-                            if dt > 0.0:
-                                fpos = st.last_pos_val + rate * dt
-                if fpos < 0.0: fpos = 0.0
-                if fpos > 1.0: fpos = 1.0
-                target = int(fpos * n_entries)
-                if target > maxstart:
-                    target = maxstart
-                cur = self._last_entry[d]
-                if cur is None or target < cur - SEEK_BACK or target - cur > SEEK_FWD:
-                    cur = target if target >= 0 else 0
-                    send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
-                else:
-                    sent = 0
-                    while cur < target and sent < MAX_PKTS_PER_TICK:
-                        cur = min(cur + ENTRIES_PER_PKT, target)
-                        send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
-                        sent += 1
-                    if sent == 0:
-                        send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], cur, st.pwv5))
-                self._last_entry[d] = cur
+                entry = int(interp_pos(st) * n_entries)
+                if entry < 0:
+                    entry = 0
+                if entry > n_entries - ENTRIES_PER_PKT:
+                    entry = max(0, n_entries - ENTRIES_PER_PKT)
+                if entry == self._last_entry[d]:
+                    continue   # dedup: only send when the playhead entry advances
+                self._last_entry[d] = entry
+                send_pkt(self.ep_out, _xx36_packet(DECK_BYTES[d], entry, st.pwv5))
             self._stop.wait(self.interval)
 
     def stop(self):

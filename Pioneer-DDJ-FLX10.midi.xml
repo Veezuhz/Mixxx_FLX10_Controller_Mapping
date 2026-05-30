@@ -3727,42 +3727,42 @@
             </control>
             <control>
                 <group>[Channel1]</group>
-                <key>sync_key</key>
-                <description>Key Sync CH1</description>
+                <key>PioneerDDJFLX10.keySyncToggle</key>
+                <description>Key Sync toggle CH1</description>
                 <status>0x90</status>
                 <midino>0x65</midino>
                 <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
                 <group>[Channel2]</group>
-                <key>sync_key</key>
-                <description>Key Sync CH2</description>
+                <key>PioneerDDJFLX10.keySyncToggle</key>
+                <description>Key Sync toggle CH2</description>
                 <status>0x91</status>
                 <midino>0x65</midino>
                 <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
                 <group>[Channel3]</group>
-                <key>sync_key</key>
-                <description>Key Sync CH3</description>
+                <key>PioneerDDJFLX10.keySyncToggle</key>
+                <description>Key Sync toggle CH3</description>
                 <status>0x92</status>
                 <midino>0x65</midino>
                 <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
                 <group>[Channel4]</group>
-                <key>sync_key</key>
-                <description>Key Sync CH4</description>
+                <key>PioneerDDJFLX10.keySyncToggle</key>
+                <description>Key Sync toggle CH4</description>
                 <status>0x93</status>
                 <midino>0x65</midino>
                 <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
             <control>
@@ -4479,14 +4479,10 @@
                 <midino>0x15</midino>
                 <minimum>0.5</minimum>
             </output>
-            <output>
-                <group>[Channel1]</group>
-                <key>sync_key</key>
-                <description>Key sync Feedback CH1</description>
-                <status>0x90</status>
-                <midino>0x65</midino>
-                <minimum>0.5</minimum>
-            </output>
+            <!-- KEY SYNC LED (note 0x65, all 4 decks) is driven by
+                 PioneerDDJFLX10.keySyncToggle (custom on/off toggle). The
+                 sync_key auto-output bindings were removed so Mixxx doesn't
+                 fight the script over the button LED. -->
             <output>
                 <group>[Channel2]</group>
                 <key>cue_indicator</key>
@@ -4533,14 +4529,7 @@
                 <midino>0x15</midino>
                 <minimum>0.5</minimum>
             </output>
-            <output>
-                <group>[Channel2]</group>
-                <key>sync_key</key>
-                <description>Key sync Feedback CH2</description>
-                <status>0x91</status>
-                <midino>0x65</midino>
-                <minimum>0.5</minimum>
-            </output>
+            <!-- Key Sync LED CH2 driven by keySyncToggle (see CH1 note above). -->
             <output>
                 <group>[Channel3]</group>
                 <key>cue_indicator</key>
@@ -4587,14 +4576,7 @@
                 <midino>0x15</midino>
                 <minimum>0.5</minimum>
             </output>
-            <output>
-                <group>[Channel3]</group>
-                <key>sync_key</key>
-                <description>Key sync Feedback CH3</description>
-                <status>0x92</status>
-                <midino>0x65</midino>
-                <minimum>0.5</minimum>
-            </output>
+            <!-- Key Sync LED CH3 driven by keySyncToggle (see CH1 note above). -->
             <output>
                 <group>[Channel4]</group>
                 <key>cue_indicator</key>
@@ -4641,14 +4623,7 @@
                 <midino>0x15</midino>
                 <minimum>0.5</minimum>
             </output>
-            <output>
-                <group>[Channel4]</group>
-                <key>sync_key</key>
-                <description>Key sync Feedback CH4</description>
-                <status>0x93</status>
-                <midino>0x65</midino>
-                <minimum>0.5</minimum>
-            </output>
+            <!-- Key Sync LED CH4 driven by keySyncToggle (see CH1 note above). -->
         </outputs>
     </controller>
 </MixxxControllerPreset>

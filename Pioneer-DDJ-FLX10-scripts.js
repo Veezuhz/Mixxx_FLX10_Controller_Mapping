@@ -466,6 +466,10 @@ PioneerDDJFLX10.init = function(id) {
         var samples = engine.getValue(group, "track_samples");
         var fbpm    = engine.getValue(group, "file_bpm");
         if (dur > 0 && samples > 0) {
+            // A new track resets the key, so clear any "key sync engaged"
+            // toggle state and turn its LED off.
+            PioneerDDJFLX10._keySyncEngaged[deck] = false;
+            PioneerDDJFLX10._setKeySyncLed(deck, false);
             // Re-send Serato's beat-grid burst on every track load.
             // Experimental — see _SYSEX_BEATGRID_BURST_PAYLOAD docs.
             try { PioneerDDJFLX10._sendBeatgridBurst(deck); } catch (e) {}
@@ -702,6 +706,33 @@ PioneerDDJFLX10.waveformZoom = function(channel, control, value, status, group) 
     var delta = value < 64 ? -1 : 1;
     var zoom = engine.getValue(group, "waveform_zoom") + delta;
     engine.setValue(group, "waveform_zoom", Math.max(1, zoom));
+};
+
+// ─── KEY SYNC button (note 0x65) — custom on/off toggle ───────────────────────
+// The hardware KEY SYNC button sends Note On 0x65 on the deck's channel
+// (deck N → status 0x90+(N-1)). We track an "engaged" state per deck:
+//   1st press → sync_key  (match this deck's key to the other deck) + LED on
+//   2nd press → reset_key (restore the track's original key)        + LED off
+// Mimics a rekordbox-style "key sync engaged" toggle with a persistent light.
+// (The blue JOG-SCREEN indicator is HID xx39, driven separately by the daemon;
+//  wiring it to this state is a follow-up — see notes.)
+PioneerDDJFLX10._keySyncEngaged = {1: false, 2: false, 3: false, 4: false};
+
+PioneerDDJFLX10._setKeySyncLed = function(deck, on) {
+    midi.sendShortMsg(0x90 + (deck - 1), 0x65, on ? 0x7F : 0x00);
+};
+
+PioneerDDJFLX10.keySyncToggle = function(channel, control, value, status, group) {
+    if (value === 0) { return; }   // act on press only; ignore the release
+    var deck = PioneerDDJFLX10._getDeckFromGroup(group);
+    var engaged = !PioneerDDJFLX10._keySyncEngaged[deck];
+    PioneerDDJFLX10._keySyncEngaged[deck] = engaged;
+    // sync_key / reset_key are edge-triggered: pulse 1 → 0 so a later press
+    // can re-fire (setting 1 and leaving it would block the next trigger).
+    var key = engaged ? "sync_key" : "reset_key";
+    engine.setValue(group, key, 1);
+    engine.setValue(group, key, 0);
+    PioneerDDJFLX10._setKeySyncLed(deck, engaged);
 };
 
 // ─── Jog wheel display ────────────────────────────────────────────────────────
